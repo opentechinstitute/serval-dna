@@ -1,0 +1,11 @@
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -54,7 +54,7 @@ CFLAGS+=-D_DARWIN_C_SOURCE
+ 
+ DEFS=	@DEFS@
+ 
+-all:	servald libmonitorclient.so libmonitorclient.a
++all:	servald libmonitorclient.so libmonitorclient.a libservald.so
+ 
+ sqlite-amalgamation-3070900/sqlite3.o:	sqlite-amalgamation-3070900/sqlite3.c
+ 	@echo CC $<

@@ -30,6 +30,8 @@ endef
 
 define Package/serval-dna/install
 	$(INSTALL_DIR) $(1)/usr/bin
+        $(INSTALL_DIR) $(1)/usr/lib
+        $(CP) $(PKG_BUILD_DIR)/libservald.so $(1)/usr/lib/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/servald $(1)/usr/bin
 endef
 
