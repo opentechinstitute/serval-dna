@@ -1,0 +1,15 @@
+Source: serval-dna
+Section: net
+Priority: optional
+Maintainer: Dan Staples <danstaples@opentechinstitute.org>
+Build-Depends: debhelper (>= 8.0.0)
+Standards-Version: 3.9.4
+Homepage: http://www.servalproject.org/
+
+Package: serval-dna
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: The Serval-DNA Daemon
+ The Serval Project's Serval Daemon, incorporating
+ Distributed Numbering Architecture (DNA), Rhizome,
+ MDP, VoMP, etc.
