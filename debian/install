@@ -1,5 +1,5 @@
-servald /usr/bin
+servald /usr/sbin
 libservald.so /usr/lib
-Debian/etc/default/serval-dna /etc/default
-Debian/etc/init.d/serval-dna /etc/init.d
-Debian/var/serval-node/serval.conf /var/serval-node
+debian/serval.conf /var/serval-node
+*.h /usr/include/serval
+nacl/include/* /usr/include/serval

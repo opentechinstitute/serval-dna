@@ -16,6 +16,25 @@ set -e
 
 case "$1" in
     install|upgrade)
+       SERVER_USER=serval
+       SERVER_GROUP=serval
+       SERVER_NAME="serval"
+       if ! getent group | grep -q "^$SERVER_GROUP:" ; then
+          echo -n "Adding group $SERVER_GROUP.."
+          addgroup --quiet --system $SERVER_GROUP 2>/dev/null ||true
+          echo "..done"
+       fi
+
+       if ! getent passwd | grep -q "^$SERVER_USER:"; then
+         echo -n "Adding system user $SERVER_USER.."
+         adduser --quiet \
+                 --system \
+                 --ingroup $SERVER_GROUP \
+                 --no-create-home \
+                 --disabled-password \
+                 $SERVER_USER 2>/dev/null || true
+         echo "..done"
+       fi
     ;;
 
     abort-upgrade)

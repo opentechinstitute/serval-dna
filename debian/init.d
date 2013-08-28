@@ -1,12 +1,10 @@
 #!/bin/sh
 ### BEGIN INIT INFO
 # Provides:          serval-dna
-# Required-Start:    $local_fs
-# Required-Stop:     $local_fs
+# Required-Start:    $local_fs $remote_fs
+# Required-Stop:     $local_fs $remote_fs
 # Should-Start:      $network
 # Should-Stop:       $network
-# X-Start-Before:    asterisk
-# X-Stop-After:      asterisk
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
 # Short-Description: Serval DNA daemon

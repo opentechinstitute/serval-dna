@@ -20,6 +20,11 @@ set -e
 
 case "$1" in
     configure)
+       INSTANCE_DIR=/var/serval-node
+       SERVER_USER=serval
+       SERVER_GROUP=serval
+       
+       chown -R $SERVER_USER:$SERVER_GROUP $INSTANCE_DIR
     ;;
 
     abort-upgrade|abort-remove|abort-deconfigure)

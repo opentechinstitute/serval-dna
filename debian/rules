@@ -13,17 +13,9 @@
 	dh $@ 
 
 override_dh_auto_configure:
-	sed -i -e s/"^#START_DAEMON"/"START_DAEMON"/ Debian/etc/default/serval-dna
 	autoreconf -f -i
 	./configure
 
 override_dh_auto_build:
 	$(MAKE)
 	$(MAKE) libservald.so
-
-override_dh_auto_install:
-	mkdir -p Debian/var/serval-node
-	echo "interfaces.0.match=*" > Debian/var/serval-node/serval.conf
-	@
-#	cp servald $(DESTDIR)/usr/bin/
-#	cp libservald.so $(DESTDIR)/usr/lib/
