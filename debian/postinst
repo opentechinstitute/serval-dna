@@ -25,6 +25,7 @@ case "$1" in
        SERVER_GROUP=serval
        
        chown -R $SERVER_USER:$SERVER_GROUP $INSTANCE_DIR
+       chmod g+w $INSTANCE_DIR
     ;;
 
     abort-upgrade|abort-remove|abort-deconfigure)

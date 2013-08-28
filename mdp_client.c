@@ -130,7 +130,7 @@ int overlay_mdp_client_init()
       WHY_perror("bind");
       return WHY("Could not bind MDP client socket to file name");
     }
-    
+    chmod(name.sun_path,S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH|S_IWOTH|S_IXOTH);
     int send_buffer_size=128*1024;
     if (setsockopt(mdp_client_socket, SOL_SOCKET, SO_RCVBUF, 
 		   &send_buffer_size, sizeof(send_buffer_size)) == -1)
