@@ -2,7 +2,7 @@ Source: serval-dna
 Section: net
 Priority: optional
 Maintainer: Dan Staples <danstaples@opentechinstitute.org>
-Build-Depends: debhelper (>= 8.0.0)
+Build-Depends: debhelper (>= 8.0.0), autoconf
 Standards-Version: 3.9.4
 Homepage: http://www.servalproject.org/
 
