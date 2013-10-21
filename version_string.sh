@@ -17,6 +17,48 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
+if [ ! -e .git ]; then
+  echo "UNKNOWN-VERSION"
+  exit
+fi
+
+usage() {
+   echo "Usage: ${0##*/} [options]"'
+
+Produces a version string for the HEAD of the Git repository in the current
+working directory.  The version string has the following form:
+
+   D.D[extra] [ -N-gXXXXXXX ] [ +USER-YYYYMMDDHHMMSS ]
+
+Where:
+   D.D[extra]              is the most recent version tag prior to HEAD, eg,
+                           0.91.RC2; if there is no tag, then a default tag
+                           of "START" is used to represent the first commit in
+                           the repository
+   -N-gXXXXXXX             is appended if there are any commits since the
+                           version tag; N is the number of commits, XXXXXXX is
+                           the abbreviated Git commit Id
+   +USER-YYYYMMDDHHMMSS    is appended if there are any local modifications;
+                           USER is the email address of the user who owns the
+                           repository, YYYYMMDDHHMMSS is the current local time
+
+Options:
+   --help               Show this message
+   --ignore-untracked   Do not count any untracked local changes to determine
+                        whether the version is locally modified
+   --unmodified         Fail with an error if there are any local modifications
+                        instead of appending the +USER-YYYYMMDDHHMMSS suffix
+   --no-default-tag     If no version tag is found, then fail with an error
+                        instead of producing a version relative to the default
+                        "START" tag
+   --default-tag=TAG    Use "TAG" instead of "START" for the default tag if no
+                        version tag is found
+   --repository=PATH    Produce a version string for the repository in the
+                        directory at PATH instead of the current working
+                        directory
+'
+}
+
 set -e
 
 get_author_label() {
