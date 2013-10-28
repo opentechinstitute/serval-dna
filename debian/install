@@ -1,0 +1,5 @@
+servald /usr/sbin
+libservald.so /usr/lib
+debian/serval.conf /var/serval-node
+*.h /usr/include/serval
+nacl/include/* /usr/include/serval

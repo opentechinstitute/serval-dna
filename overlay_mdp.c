@@ -105,6 +105,7 @@ int overlay_mdp_setup_sockets()
 	mdp_named.poll.fd = -1;
 	WARN("Could not bind named unix domain socket");
       }
+      chmod(name.sun_path,S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH|S_IXOTH);
       int send_buffer_size=64*1024;    
       if (setsockopt(mdp_named.poll.fd, SOL_SOCKET, SO_RCVBUF, &send_buffer_size, sizeof(send_buffer_size)) == -1)
 	WARN_perror("setsockopt(SO_RCVBUF)");
