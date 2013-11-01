@@ -191,6 +191,8 @@ void keyring_free(keyring_file *k)
 
   /* Wipe everything, just to be sure. */
   bzero(k,sizeof(keyring_file));
+  
+  free(k);
 
   return;
 }
@@ -207,6 +209,7 @@ void keyring_free_context(keyring_context *c)
   }
   if (c->KeyRingSalt) {
     bzero(c->KeyRingSalt,c->KeyRingSaltLen);
+    free(c->KeyRingSalt);
     c->KeyRingSalt=NULL;
     c->KeyRingSaltLen=0;
   }
@@ -217,6 +220,8 @@ void keyring_free_context(keyring_context *c)
 
   /* Make sure any private data is wiped out */
   bzero(c,sizeof(keyring_context));
+  
+  free(c);
 
   return;
 }
@@ -246,6 +251,9 @@ void keyring_free_identity(keyring_identity *id)
   }
     
   bzero(id,sizeof(keyring_identity));
+  
+  free(id);
+  
   return;
 }
 
@@ -263,6 +271,9 @@ void keyring_free_keypair(keypair *kp)
   }
   
   bzero(kp,sizeof(keypair));
+  
+  free(kp);
+  
   return;
 }
 
