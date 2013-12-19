@@ -1,6 +1,6 @@
-serval-dna (0.91-1.1) experimental; urgency=low
+serval-dna (0.91-1.1~precise0) precise; urgency=low
 
-  * Non-maintainer upload.
+  * Ubuntu packaging
 
 
  -- Nat Meysenburg <nat@opentechinstitute.org>  Thu, 19 Dec 2013 13:06:46 -0500
