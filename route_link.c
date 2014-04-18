@@ -1042,6 +1042,7 @@ int link_receive(overlay_mdp_frame *mdp)
       // TODO other link attributes...
     }
   }
+  ob_free(payload);
 
   send_please_explain(&context, my_subscriber, sender);
 
