@@ -1,6 +1,6 @@
 /*
  Serval Distributed Numbering Architecture (DNA)
- Copyright (C) 2012 Serval Project, Inc.
+ Copyright (C) 2012 Serval Project Inc.
  
  This program is free software; you can redistribute it and/or
  modify it under the terms of the GNU General Public License
@@ -17,7 +17,36 @@
  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include "serval.h"
+/*
+  Portions Copyright (C) 2013 Petter Reinholdtsen
+  Some rights reserved
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in
+     the documentation and/or other materials provided with the
+     distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#include "fdqueue.h"
 #include "conf.h"
 
 struct profile_total *stats_head=NULL;
@@ -40,11 +69,11 @@ int fd_tallystats(struct profile_total *total,struct profile_total *a)
 
 int fd_showstat(struct profile_total *total, struct profile_total *a)
 {
-  INFOF("%lldms (%2.1f%%) in %d calls (max %lldms, avg %.1fms, +child avg %.1fms) : %s",
-       (long long) a->total_time,
+  INFOF("%"PRId64"ms (%2.1f%%) in %d calls (max %"PRId64"ms, avg %.1fms, +child avg %.1fms) : %s",
+       (int64_t) a->total_time,
        a->total_time*100.0/total->total_time,
        a->calls,
-       (long long) a->max_time,
+       (int64_t) a->max_time,
        a->total_time*1.00/a->calls,
        (a->total_time+a->child_time)*1.00/a->calls,
        a->name);
@@ -138,7 +167,7 @@ int fd_clearstats()
 
 int fd_showstats()
 {
-  struct profile_total total={NULL, 0, "Total", 0,0,0};
+  struct profile_total total={NULL, 0, "Total", 0,0,0,0};
   
   stats_head = sort(stats_head);
   
@@ -149,18 +178,6 @@ int fd_showstats()
     stats = stats->_next;
   }
 
-  // Show periodic rhizome transfer information, but only
-  // if there are some active rhizome transfers.
-  if (rhizome_active_fetch_count()!=0)
-    INFOF("Rhizome transfer progress: %d,%d,%d,%d,%d,%d (remaining %d)",
-	  rhizome_active_fetch_bytes_received(0),
-	  rhizome_active_fetch_bytes_received(1),
-	  rhizome_active_fetch_bytes_received(2),
-	  rhizome_active_fetch_bytes_received(3),
-	  rhizome_active_fetch_bytes_received(4),
-	  rhizome_active_fetch_bytes_received(5),
-          rhizome_fetch_queue_bytes());
-
   // Report any functions that take too much time
   if (!config.debug.timing)
     {
@@ -168,8 +185,8 @@ int fd_showstats()
       while(stats!=NULL){
 	/* If a function spends more than 1 second in any 
 	   notionally 3 second period, then dob on it */
-	if (stats->total_time>1000
-	    &&strcmp(stats->name,"Idle (in poll)"))
+	if ((stats->total_time>1000 || stats->calls > 10000)
+	    && strcmp(stats->name,"Idle (in poll)"))
 	  fd_showstat(&total,stats);
 	stats = stats->_next;
       }
@@ -198,14 +215,23 @@ void fd_periodicstats(struct sched_ent *alarm)
   schedule(alarm);
 }
 
-void dump_stack()
+void dump_stack(int log_level)
 {
   struct call_stats *call = current_call;
   while(call){
     if (call->totals)
-      INFOF("%s",call->totals->name);
+      LOGF(log_level, "%s",call->totals->name);
     call=call->prev;
   }
+}
+
+unsigned fd_depth()
+{
+  unsigned depth = 0;
+  struct call_stats *call;
+  for (call = current_call; call; call = call->prev)
+    ++depth;
+  return depth;
 }
 
 int fd_func_enter(struct __sourceloc __whence, struct call_stats *this_call)

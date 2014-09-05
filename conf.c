@@ -84,7 +84,7 @@ static int reload(const char *path, int *resultp)
   if (meta.mtime == -1) {
     WARNF("config file %s does not exist -- using all defaults", path);
   } else if (meta.size > CONFIG_FILE_MAX_SIZE) {
-    WHYF("config file %s is too big (%ld bytes exceeds limit %ld)", path, meta.size, CONFIG_FILE_MAX_SIZE);
+    WHYF("config file %s is too big (%ju bytes exceeds limit %d)", path, (uintmax_t)meta.size, CONFIG_FILE_MAX_SIZE);
     return -1;
   } else if (meta.size <= 0) {
     WARNF("config file %s is zero size -- using all defaults", path);
@@ -100,9 +100,9 @@ static int reload(const char *path, int *resultp)
     }
     if (fread(buf, meta.size, 1, f) != 1) {
       if (ferror(f))
-	WHYF_perror("fread(%s, %llu)", path, (unsigned long long) meta.size);
+	WHYF_perror("fread(%s, %"PRIu64")", path, (uint64_t) meta.size);
       else
-	WHYF("fread(%s, %llu) hit EOF", path, (unsigned long long) meta.size);
+	WHYF("fread(%s, %"PRIu64") hit EOF", path, (uint64_t) meta.size);
       free(buf);
       fclose(f);
       return -1;

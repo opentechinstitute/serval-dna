@@ -1,13 +1,21 @@
 # Included by top-level Android.mk
 
-SERVAL_BASE=serval-dna/
-include jni/serval-dna/sourcefiles.mk
-include jni/serval-dna/androidonlysources.mk
-SERVALD_SRC_FILES = $(SERVAL_SOURCES) $(ANDROIDONLY_SOURCES)
+LOCAL_PATH := $(call my-dir)
+include $(CLEAR_VARS)
+include $(LOCAL_PATH)/sourcefiles.mk
+SERVALD_SRC_FILES = \
+    $(SQLITE3_SOURCES) \
+    $(SERVAL_CLIENT_SOURCES) \
+    $(SERVAL_DAEMON_SOURCES) \
+    $(ANDROIDONLY_SOURCES)
+NACL_BASE = nacl/src
+NACL_INC := $(LOCAL_PATH)/nacl/include
+include $(LOCAL_PATH)/$(NACL_BASE)/nacl.mk
+SQLITE3_INC := $(LOCAL_PATH)/sqlite-amalgamation-3070900
 
 SERVALD_LOCAL_CFLAGS = \
 	-g \
-        -DSERVALD_VERSION="\"Android\"" \
+        -DSERVALD_VERSION="\"Android\"" -DSERVALD_COPYRIGHT="\"Android\"" \
         -DSHELL -DPACKAGE_NAME=\"\" -DPACKAGE_TARNAME=\"\" -DPACKAGE_VERSION=\"\" \
         -DPACKAGE_STRING=\"\" -DPACKAGE_BUGREPORT=\"\" -DPACKAGE_URL=\"\" \
         -DHAVE_LIBC=1 -DSTDC_HEADERS=1 -DHAVE_SYS_TYPES_H=1 -DHAVE_SYS_STAT_H=1 \
@@ -17,48 +25,29 @@ SERVALD_LOCAL_CFLAGS = \
         -DHAVE_STRING_H=1 -DHAVE_ARPA_INET_H=1 -DHAVE_SYS_SOCKET_H=1 \
         -DHAVE_SYS_MMAN_H=1 -DHAVE_SYS_TIME_H=1 -DHAVE_POLL_H=1 -DHAVE_NETDB_H=1 \
 	-DHAVE_JNI_H=1 -DHAVE_STRUCT_UCRED=1 -DHAVE_CRYPTO_SIGN_NACL_GE25519_H=1 \
-        -DBYTE_ORDER=_BYTE_ORDER -DHAVE_LINUX_STRUCT_UCRED \
-        -DHAVE_BCOPY -DHAVE_BZERO \
+        -DBYTE_ORDER=_BYTE_ORDER -DHAVE_LINUX_STRUCT_UCRED -DUSE_ABSTRACT_NAMESPACE \
+        -DHAVE_BCOPY -DHAVE_BZERO -DHAVE_NETINET_IN_H -DHAVE_LSEEK64 -DSIZEOF_OFF_T=4 \
 	-I$(NACL_INC) \
 	-I$(SQLITE3_INC)
 
 SERVALD_LOCAL_LDLIBS = -L$(SYSROOT)/usr/lib -llog 
-SERVALD_LOCAL_STATIC_LIBRARIES = sqlite3 nacl
 
-# Build NACL
+# Build libserval.so
 include $(CLEAR_VARS)
-# Work out where NACL is
-NACL_BASE=serval-dna/nacl/src
-NACL_INC=$(LOCAL_PATH)/$(NACL_BASE)/../include
-# Find sources
-include $(LOCAL_PATH)/$(NACL_BASE)/nacl.mk
-LOCAL_MODULE:= nacl
-LOCAL_SRC_FILES:= $(NACL_SOURCES)
-LOCAL_CFLAGS += -g -I$(NACL_INC)
-include $(BUILD_STATIC_LIBRARY)
-
-# Build libservald.so
-include $(CLEAR_VARS)
-# Find SQLITE3 headers
-SQLITE3_INC=$(LOCAL_PATH)/sqlite3
-# Get the list of sources
-include $(LOCAL_PATH)/serval-dna/nacl/src/nacl.mk
-LOCAL_SRC_FILES:= $(SERVALD_SRC_FILES) $(SERVAL_BASE)version_servald.c
-LOCAL_CFLAGS += $(SERVALD_LOCAL_CFLAGS) -Iserval-dna/nacl/include
+LOCAL_SRC_FILES := $(NACL_SOURCES) $(SERVALD_SRC_FILES) version_servald.c
+LOCAL_CFLAGS += $(SERVALD_LOCAL_CFLAGS)
 LOCAL_LDLIBS := $(SERVALD_LOCAL_LDLIBS)
-LOCAL_STATIC_LIBRARIES := $(SERVALD_LOCAL_STATIC_LIBRARIES)
-LOCAL_MODULE:= serval
+LOCAL_MODULE := serval
 include $(BUILD_SHARED_LIBRARY)
 
-# Build libserval.so wrapper
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES:= serval-dna/servalwrap.c
+LOCAL_SRC_FILES:= servalwrap.c
 LOCAL_MODULE:= servald
 include $(BUILD_EXECUTABLE)
 
 # Build servald for use with gdb
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES:= $(SERVALD_SRC_FILES) $(SERVAL_BASE)version_servald.c
+LOCAL_SRC_FILES:= $(NACL_SOURCES) $(SERVALD_SRC_FILES) version_servald.c
 LOCAL_CFLAGS += $(SERVALD_LOCAL_CFLAGS)
 LOCAL_LDLIBS := $(SERVALD_LOCAL_LDLIBS)
 LOCAL_STATIC_LIBRARIES := $(SERVALD_LOCAL_STATIC_LIBRARIES)

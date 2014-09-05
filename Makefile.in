@@ -1,61 +1,43 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+bindir=@bindir@
+sbindir=@sbindir@
+
 NACL_BASE=	nacl/src
 include $(NACL_BASE)/nacl.mk
-SERVAL_BASE=
 include sourcefiles.mk
 include headerfiles.mk
 
+SERVALD_SRCS = \
+        $(SQLITE3_SOURCES) \
+        $(NACL_SOURCES) \
+        $(SERVAL_CLIENT_SOURCES) \
+        $(SERVAL_DAEMON_SOURCES)
+
 HAVE_ALSA= @HAVE_ALSA@
 ifeq (HAVE_ALSA,1)
-SERVAL_SOURCES+=	$(SERVAL_BASE)/audio_alsa.c
+SERVALD_SRCS+=	audio_alsa.c
 endif
 
 HAVE_VOIPTEST=	@HAVE_VOIPTEST@
 ifeq ($(HAVE_VOIPTEST), 1)
-SERVAL_SOURCES+=	$(SERVAL_BASE)/pa_phone.c
+SERVALD_SRCS+=	pa_phone.c
 VOIPTEST_CFLAGS=-DHAVE_VOIPTEST=1
 endif
 
-SRCS=	$(NACL_SOURCES) $(SERVAL_SOURCES)
+MONITOR_CLIENT_SRCS = \
+        $(SERVAL_CLIENT_SOURCES) \
+	monitor-client.c
 
-MONITORCLIENTSRCS=conf.c \
-        conf_om.c \
-        conf_parse.c \
-        conf_schema.c \
-	dataformats.c \
-	log.c \
-        xprintf.c \
-	os.c \
-	mem.c \
-	monitor-client.c \
-        instance.c \
-	net.c \
-	str.c \
-	strbuf.c \
-	strbuf_helpers.c \
-	rotbuf.c
-
-MDPCLIENTSRCS=conf.c \
-        conf_om.c \
-        conf_parse.c \
-        conf_schema.c \
-	dataformats.c \
-	os.c \
-	mem.c \
-	log.c \
-        xprintf.c \
+MDP_CLIENT_SRCS = \
+        $(SERVAL_CLIENT_SOURCES) \
 	mdp_client.c \
-        instance.c \
-	net.c \
-	str.c \
-	strbuf.c \
-	strbuf_helpers.c \
-	rotbuf.c
+        mdp_net.c
 
-OBJS=	$(SRCS:.c=.o)
-SERVAL_OBJS=	$(SERVAL_SOURCES:.c=.o)
-MONITORCLIENTOBJS=	$(MONITORCLIENTSRCS:.c=.o)
-MDPCLIENTOBJS=	$(MDPCLIENTSRCS:.c=.o)
-
+SERVALD_OBJS=	        $(SERVALD_SRCS:.c=.o)
+SERVAL_DAEMON_OBJS=	$(SERVAL_DAEMON_SOURCES:.c=.o)
+MONITOR_CLIENT_OBJS=	$(MONITOR_CLIENT_SRCS:.c=.o)
+MDP_CLIENT_OBJS=	$(MDP_CLIENT_SRCS:.c=.o)
 
 LDFLAGS=@LDFLAGS@ @LIBS@ @PORTAUDIO_LIBS@ @SRC_LIBS@ @SPANDSP_LIBS@ @CODEC2_LIBS@ @PTHREAD_LIBS@
 
@@ -66,54 +48,104 @@ CFLAGS+=-Wall -Wno-unused-value
 CFLAGS+=-DSHA2_USE_INTTYPES_H -D_XOPEN_SOURCE=600 -D_XOPEN_SOURCE_EXTENDED=1 -D__EXTENSIONS__=1
 # OSX magic to compensate for the Solaris magic
 CFLAGS+=-D_DARWIN_C_SOURCE
+
+INSTALL=        install
+INSTALL_PROGRAM=$(INSTALL)
+INSTALL_DATA=   $(INSTALL) -m 644
+
 -include Makefile.dbg
+
+# More warnings, discover problems that only happen on some archs
+CFLAGS+=-Wextra
+# Security enhancements from Debian
+CFLAGS+=-Wformat -Werror=format-security -D_FORTIFY_SOURCE=2
 
 DEFS=	@DEFS@
 
-all:	servald libmonitorclient.so libmonitorclient.a tfw_createfile
+.PHONY: all test clean
+
+all:	servald libmonitorclient.so libmonitorclient.a test
+
+test:   tfw_createfile directory_service fakeradio config_test
 
 sqlite-amalgamation-3070900/sqlite3.o:	sqlite-amalgamation-3070900/sqlite3.c
 	@echo CC $<
 	@$(CC) $(CFLAGS) $(DEFS) -c $< -o sqlite-amalgamation-3070900/sqlite3.o
 
+version.o: *.h *.c version_string.sh VERSION.txt COPYRIGHT.txt Makefile
+	@echo CC version_servald.c
+	@V=`./version_string.sh --ignore-untracked` \
+	 && C="`sed -e :a -e N -e '$$!ba' -e 's/[\\\\"]/\\\\&/g' -e 's/\\n/\\\\n/g' COPYRIGHT.txt`" \
+	 && $(CC) -c version_servald.c -o $@ -DSERVALD_VERSION="\"$$V\"" -DSERVALD_COPYRIGHT="\"$$C\""
+
+VERSION.txt:
+
 %.o:	%.c
 	@echo CC $<
 	@$(CC) $(CFLAGS) $(DEFS) -c $< -o $@
 
-$(SERVAL_OBJS): $(HDRS)
-$(MONITORCLIENTOBJS): $(HDRS)
-$(MDPCLIENTOBJS): $(HDRS)
+$(SERVAL_DAEMON_OBJS): $(HDRS)
+$(MONITOR_CLIENT_OBJS): $(HDRS)
+$(MDP_CLIENT_OBJS): $(HDRS)
 
-servald:	$(OBJS)
+servald:	$(SERVALD_OBJS) version.o
 	@echo LINK $@
-	@v=`./version_string.sh` \
-            && $(CC) $(CFLAGS) -Wall -o $@ -DSERVALD_VERSION="\"$$v\"" version_servald.c $(OBJS) $(LDFLAGS)
+	@$(CC) $(CFLAGS) -Wall -o $@ $(SERVALD_OBJS) version.o $(LDFLAGS)
 
-directory_service: $(MDPCLIENTOBJS) directory_service.o
+directory_service: $(MDP_CLIENT_OBJS) version.o directory_service.o
 	@echo LINK $@
-	@v=`./version_string.sh` \
-            && $(CC) $(CFLAGS) -Wall -o $@ -DSERVALD_VERSION="\"$$v\"" version_servald.c $(MDPCLIENTOBJS) directory_service.o $(LDFLAGS)
+	@$(CC) $(CFLAGS) -Wall -o $@ $(MDP_CLIENT_OBJS) version.o directory_service.o $(LDFLAGS)
 
 tfw_createfile: tfw_createfile.o str.o strbuf.o strbuf_helpers.o
 	@echo LINK $@
 	@$(CC) $(CFLAGS) -Wall -o $@ tfw_createfile.o str.o strbuf.o strbuf_helpers.o
 
+fakeradio: fakeradio.o
+	@echo LINK $@
+	@$(CC) $(CFLAGS) -Wall -o $@ fakeradio.o
+
+config_test: config_test.o conf_om.o conf_schema.o conf_parse.o str.o strbuf.o strbuf_helpers.o mem.o dataformats.o net.o log_util.o
+	@echo LINK $@
+	@$(CC) $(CFLAGS) -Wall -o $@ config_test.o conf_om.o conf_schema.o conf_parse.o str.o strbuf.o strbuf_helpers.o mem.o dataformats.o net.o log_util.o $(LDFLAGS)
+
+copyright:
+	@if [ -x "$(COPYRIGHT_TOOL)" ]; then \
+            echo GENERATE COPYRIGHT.txt; \
+            $(COPYRIGHT_TOOL) -o COPYRIGHT.txt condense *.c *.h; \
+        else \
+            echo 'sp-copyright-tool is not in $$PATH; COPYRIGHT.txt not updated'; \
+        fi
+
+findPATH = $(firstword $(wildcard $(addsuffix /$(1),$(subst :, ,$(PATH)))))
+COPYRIGHT_TOOL := $(call findPATH,sp-copyright-tool)
+
 # This does not build on 64 bit elf platforms as NaCL isn't built with -fPIC
 # DOC 20120615
-libservald.so: $(OBJS)
+libserval.so: $(SERVALD_OBJS) version.o
 	@echo LINK $@
-	@v=`./version_string.sh` && $(CC) $(CFLAGS) $(DEFS) -DSERVALD_VERSION="\"$$v\"" -Wall -o version_servald.o -c version_servald.c
-	@$(CC) $(CFLAGS) -Wall -shared -o $@ $(OBJS) version_servald.o $(LDFLAGS)
+	@$(CC) $(CFLAGS) -Wall -shared -o $@ $(SERVALD_OBJS) version.o $(LDFLAGS)
 
-libmonitorclient.so: $(MONITORCLIENTOBJS)
+libmdpclient.so: $(MDP_CLIENT_OBJS) version.o
 	@echo LINK $@
-	@v=`./version_string.sh` && $(CC) $(CFLAGS) $(DEFS) -DSERVALD_VERSION="\"$$v\"" -Wall -o version_libmonitorclient.o -c version_servald.c
-	@$(CC) $(CFLAGS) -Wall -shared -o $@ $(MONITORCLIENTOBJS) version_libmonitorclient.o $(LDFLAGS)
+	@$(CC) $(CFLAGS) -Wall -shared -o $@ $(MDP_CLIENT_OBJS) version.o $(LDFLAGS)
 
-libmonitorclient.a: $(MONITORCLIENTOBJS)
+libmonitorclient.so: $(MONITOR_CLIENT_OBJS) version.o
+	@echo LINK $@
+	@$(CC) $(CFLAGS) -Wall -shared -o $@ $(MONITOR_CLIENT_OBJS) version.o $(LDFLAGS)
+
+libmonitorclient.a: $(MONITOR_CLIENT_OBJS) version.o
 	@echo AR $@
-	@v=`./version_string.sh` && $(CC) $(CFLAGS) $(DEFS) -DSERVALD_VERSION="\"$$v\"" -Wall -o version_libmonitorclient.o -c version_servald.c
-	@$(AR) -cr $@ $(MONITORCLIENTOBJS) version_libmonitorclient.o
+	@$(AR) -cr $@ $(MONITOR_CLIENT_OBJS) version.o
+
+install: servald
+	$(INSTALL_PROGRAM) -D servald $(DESTDIR)$(sbindir)/servald
+
+uninstall:
+	$(RM) $(DESTDIR)$(sbindir)/servald
 
 clean:
-	@rm -f $(OBJS) servald libservald.so libmonitorclient.so version_libmonitorclient.o libmonitorclient.a
+	@$(RM) $(SERVALD_OBJS) $(MONITOR_CLIENT_OBJS) $(MDP_CLIENT_OBJS) \
+	  tfw_createfile.o version.o \
+	  fakeradio.o fakeradio \
+	  tfw_createfile servald \
+	  libservald.so libmonitorclient.so libmonitorclient.a

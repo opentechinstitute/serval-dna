@@ -1,6 +1,6 @@
-/* 
-Serval Distributed Numbering Architecture (DNA)
-Copyright (C) 2010 Paul Gardner-Stephen 
+/*
+Serval DNA Golay coding
+Copyright (C) 2013 Serval Project Inc.
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -17,17 +17,10 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
-#include "serval.h"
-#include "conf.h"
-#include "str.h"
+#ifndef __SERVAL_DNA__GOLAY_H
+#define __SERVAL_DNA__GOLAY_H
 
-int stowSid(unsigned char *packet, int ofs, const char *sid)
-{
-  if (config.debug.packetformats)
-    printf("stowing SID \"%s\"\n", sid);
-  if (strcasecmp(sid,"broadcast") == 0)
-    memset(packet + ofs, 0xff, SID_SIZE);
-  else if (fromhex(packet + ofs, sid, SID_SIZE) != SID_SIZE || sid[SID_STRLEN] != '\0')
-    return WHY("invalid SID");
-  return 0;
-}
+int golay_encode(uint8_t *data);
+int golay_decode(int *errs, uint8_t *data);
+
+#endif

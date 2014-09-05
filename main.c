@@ -1,6 +1,6 @@
 /*
-Serval daemon
-Copyright (C) 2012 The Serval Project
+Serval DNA daemon
+Copyright (C) 2012 Serval Project Inc.
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -33,7 +33,7 @@ int main(int argc, char **argv)
   srandomdev();
   server_save_argv(argc, (const char*const*)argv);
   cf_init();
-  int status = parseCommandLine(argv[0], argc - 1, (const char*const*)&argv[1]);
+  int status = parseCommandLine(NULL, argv[0], argc - 1, (const char*const*)&argv[1]);
 #if defined WIN32
   WSACleanup();
 #endif

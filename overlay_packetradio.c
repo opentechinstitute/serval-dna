@@ -1,6 +1,27 @@
+/*
+Serval DNA packet radio interface
+Copyright (C) 2013 Serval Project Inc.
+Copyright (C) 2013 Paul Gardner-Stephen
+ 
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
+
+#include <termios.h>
 #include "serval.h"
 #include "conf.h"
-#include <termios.h>
+#include "overlay_interface.h"
 
 int overlay_packetradio_setup_port(overlay_interface *interface)
 {
@@ -28,9 +49,7 @@ int overlay_packetradio_setup_port(overlay_interface *interface)
   case 38400: baud_rate = B38400; break;
   default:
   case 57600: baud_rate = B57600; break;
-#ifdef B11520
-  case 115200: baud_rate = B11520; break;
-#endif
+  case 115200: baud_rate = B115200; break;
   case 230400: baud_rate = B230400; break;
   }
 
@@ -70,29 +89,11 @@ int overlay_packetradio_setup_port(overlay_interface *interface)
   if (tcsetattr(interface->alarm.poll.fd, TCSANOW, &t))
     WHY_perror("Failed to set terminal parameters");
   
-  // Ask radio to report RSSI
-  (void)write_all(interface->alarm.poll.fd,"\r",1);
-  usleep(1200000);
-  (void)write_all(interface->alarm.poll.fd,"+++",3);
-  usleep(1200000);
-  (void)write_all(interface->alarm.poll.fd,"\rAT&T\rAT&T=RSSI\rATO\r",20);
   if (config.debug.packetradio) {
     tcgetattr(interface->alarm.poll.fd, &t);
     int in_speed=cfgetispeed(&t);
     int out_speed=cfgetospeed(&t);
-
-    DEBUGF("Enabled RSSI reporting for RFD900 radios");
-    DEBUGF("Sent ATO to make sure we are in on-line mode");
     DEBUGF("uart speed reported as %d/%d",in_speed,out_speed);
-  }
-  
-  if (0){
-    // dummy write of all possible ascii values
-    char buff[256];
-    int i;
-    for (i=0;i<sizeof buff;i++)
-      buff[i]=i;
-    (void)write_all(interface->alarm.poll.fd,buff,sizeof buff);
   }
   
   set_nonblock(interface->alarm.poll.fd);

@@ -1,16 +1,34 @@
+/*
+Serval DNA MDP overlay network link tracking
+Copyright (C) 2012-2013 Serval Project Inc.
+Copyright (C) 2010-2012 Paul Gardner-Stephen
+ 
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
+
 #include "serval.h"
 #include "conf.h"
 #include "str.h"
 #include "overlay_address.h"
 #include "overlay_buffer.h"
+#include "overlay_interface.h"
 #include "overlay_packet.h"
+#include "keyring.h"
+#include "strbuf_helpers.h"
 
 #define MIN_BURST_LENGTH 5000
-
-struct probe_contents{
-  struct sockaddr_in addr;
-  unsigned char interface;
-};
 
 static void update_limit_state(struct limit_state *state, time_ms_t now){
   if (state->next_interval > now || state->burst_size==0){
@@ -28,6 +46,8 @@ static void update_limit_state(struct limit_state *state, time_ms_t now){
 /* When should we next allow this thing to occur? */
 time_ms_t limit_next_allowed(struct limit_state *state){
   time_ms_t now = gettime_ms();
+  if (!state->burst_length)
+    return now;
   update_limit_state(state, now);
   
   if (state->sent < state->burst_size)
@@ -38,6 +58,8 @@ time_ms_t limit_next_allowed(struct limit_state *state){
 /* Can we do this now? if so, track it */
 int limit_is_allowed(struct limit_state *state){
   time_ms_t now = gettime_ms();
+  if (!state->burst_length)
+    return 0;
   update_limit_state(state, now);
   if (state->sent >= state->burst_size){
     return -1;
@@ -50,6 +72,7 @@ int limit_is_allowed(struct limit_state *state){
 int limit_init(struct limit_state *state, int rate_micro_seconds){
   if (rate_micro_seconds==0){
     state->burst_size=0;
+    state->burst_length=1;
   }else{
     state->burst_size = (MIN_BURST_LENGTH / rate_micro_seconds)+1;
     state->burst_length = (state->burst_size * rate_micro_seconds) / 1000.0;
@@ -57,76 +80,40 @@ int limit_init(struct limit_state *state, int rate_micro_seconds){
   return 0;
 }
 
-// quick test to make sure the specified route is valid.
-int subscriber_is_reachable(struct subscriber *subscriber){
-  if (!subscriber)
-    return REACHABLE_NONE;
+int set_reachable(struct subscriber *subscriber, 
+  struct network_destination *destination, struct subscriber *next_hop){
   
-  int ret = subscriber->reachable;
+  int reachable = REACHABLE_NONE;
+  if (destination)
+    reachable = destination->unicast?REACHABLE_UNICAST:REACHABLE_BROADCAST;
+  else if(next_hop)
+    reachable = REACHABLE_INDIRECT;
   
-  if (ret==REACHABLE_INDIRECT){
-    if (!subscriber->next_hop)
-      ret = REACHABLE_NONE;
-    
-    // avoid infinite recursion...
-    else if (!(subscriber->next_hop->reachable & REACHABLE_DIRECT))
-      ret = REACHABLE_NONE;
-    else{
-      int r = subscriber_is_reachable(subscriber->next_hop);
-      if (r&REACHABLE_ASSUMED)
-	ret = REACHABLE_NONE;
-      else if (!(r & REACHABLE_DIRECT))
-	ret = REACHABLE_NONE;
-    }
-  }
-  
-  if (ret & REACHABLE_DIRECT){
-    // make sure the interface is still up
-    if (!subscriber->interface)
-      ret=REACHABLE_NONE;
-    else if (subscriber->interface->state!=INTERFACE_STATE_UP)
-      ret=REACHABLE_NONE;
-  }
-  
-  return ret;
-}
-
-int set_reachable(struct subscriber *subscriber, int reachable){
-  if (subscriber->reachable==reachable)
+  if (subscriber->reachable==reachable 
+    && subscriber->next_hop==next_hop 
+    && subscriber->destination == destination)
     return 0;
+  
   int old_value = subscriber->reachable;
-  subscriber->reachable=reachable;
+  subscriber->reachable = reachable;
+  set_destination_ref(&subscriber->destination, destination);
+  subscriber->next_hop = next_hop;
   
   // These log messages are for use in tests.  Changing them may break test scripts.
-  if (config.debug.overlayrouting) {
+  if (config.debug.overlayrouting || config.debug.linkstate) {
     switch (reachable) {
       case REACHABLE_NONE:
-	DEBUGF("NOT REACHABLE sid=%s", alloca_tohex_sid(subscriber->sid));
-	break;
-      case REACHABLE_SELF:
+	DEBUGF("NOT REACHABLE sid=%s", alloca_tohex_sid_t(subscriber->sid));
 	break;
       case REACHABLE_INDIRECT:
-	DEBUGF("REACHABLE INDIRECTLY sid=%s", alloca_tohex_sid(subscriber->sid));
-	DEBUGF("(via %s, %d)",subscriber->next_hop?alloca_tohex_sid(subscriber->next_hop->sid):"NOONE!"
-	       ,subscriber->next_hop?subscriber->next_hop->reachable:0);
+	DEBUGF("REACHABLE INDIRECTLY sid=%s, via %s", 
+	  alloca_tohex_sid_t(subscriber->sid), alloca_tohex_sid_t(next_hop->sid));
 	break;
       case REACHABLE_UNICAST:
-	DEBUGF("REACHABLE VIA UNICAST sid=%s", alloca_tohex_sid(subscriber->sid));
+	DEBUGF("REACHABLE VIA UNICAST sid=%s, on %s ", alloca_tohex_sid_t(subscriber->sid), destination->interface->name);
 	break;
       case REACHABLE_BROADCAST:
-	DEBUGF("REACHABLE VIA BROADCAST sid=%s", alloca_tohex_sid(subscriber->sid));
-	break;
-      case REACHABLE_BROADCAST|REACHABLE_UNICAST:
-	DEBUGF("REACHABLE VIA BROADCAST & UNICAST sid=%s", alloca_tohex_sid(subscriber->sid));
-	break;
-      case REACHABLE_UNICAST|REACHABLE_ASSUMED:
-	DEBUGF("ASSUMED REACHABLE VIA UNICAST sid=%s", alloca_tohex_sid(subscriber->sid));
-	break;
-      case REACHABLE_BROADCAST|REACHABLE_ASSUMED:
-	DEBUGF("ASSUMED REACHABLE VIA BROADCAST sid=%s", alloca_tohex_sid(subscriber->sid));
-	break;
-      case REACHABLE_BROADCAST|REACHABLE_UNICAST|REACHABLE_ASSUMED:
-	DEBUGF("ASSUMED REACHABLE VIA BROADCAST & UNICAST sid=%s", alloca_tohex_sid(subscriber->sid));
+	DEBUGF("REACHABLE VIA BROADCAST sid=%s, on %s ", alloca_tohex_sid_t(subscriber->sid), destination->interface->name);
 	break;
     }
   }
@@ -140,28 +127,11 @@ int set_reachable(struct subscriber *subscriber, int reachable){
     directory_registration();
   
   if ((old_value & REACHABLE) && (!(reachable & REACHABLE)))
-    monitor_announce_unreachable_peer(subscriber->sid);
+    monitor_announce_unreachable_peer(&subscriber->sid);
   if ((!(old_value & REACHABLE)) && (reachable & REACHABLE))
-    monitor_announce_peer(subscriber->sid);
+    monitor_announce_peer(&subscriber->sid);
   
-  return 0;
-}
-
-// mark the subscriber as reachable via reply unicast packet
-int reachable_unicast(struct subscriber *subscriber, overlay_interface *interface, struct in_addr addr, int port){
-  if (subscriber->reachable&REACHABLE)
-    return -1;
-  
-  if (subscriber->node)
-    return -1;
-  
-  subscriber->interface = interface;
-  subscriber->address.sin_family = AF_INET;
-  subscriber->address.sin_addr = addr;
-  subscriber->address.sin_port = htons(port);
-  set_reachable(subscriber, REACHABLE_UNICAST);
-  
-  return 0;
+  return 1;
 }
 
 int resolve_name(const char *name, struct in_addr *addr){
@@ -191,9 +161,9 @@ int resolve_name(const char *name, struct in_addr *addr){
 // load a unicast address from configuration
 int load_subscriber_address(struct subscriber *subscriber)
 {
-  if (subscriber_is_reachable(subscriber)&REACHABLE)
+  if (!subscriber || subscriber->reachable&REACHABLE)
     return 0;
-  int i = config_host_list__get(&config.hosts, (const sid_t*)subscriber->sid);
+  int i = config_host_list__get(&config.hosts, &subscriber->sid);
   // No unicast configuration? just return.
   if (i == -1)
     return 1;
@@ -204,14 +174,15 @@ int load_subscriber_address(struct subscriber *subscriber)
     if (!interface)
       return WHY("Can't fund configured interface");
   }
-  struct sockaddr_in addr;
+  struct socket_address addr;
   bzero(&addr, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_addr = hostc->address;
-  addr.sin_port = htons(hostc->port);
-  if (addr.sin_addr.s_addr==INADDR_NONE){
+  addr.addrlen = sizeof(addr.inet);
+  addr.inet.sin_family = AF_INET;
+  addr.inet.sin_addr = hostc->address;
+  addr.inet.sin_port = htons(hostc->port);
+  if (addr.inet.sin_addr.s_addr==INADDR_NONE){
     if (interface || overlay_interface_get_default()){
-      if (resolve_name(hostc->host, &addr.sin_addr))
+      if (resolve_name(hostc->host, &addr.inet.sin_addr))
 	return -1;
     }else{
       // interface isnt up yet
@@ -219,86 +190,53 @@ int load_subscriber_address(struct subscriber *subscriber)
     }
   }
   if (config.debug.overlayrouting)
-    DEBUGF("Loaded address %s:%d for %s", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), alloca_tohex_sid(subscriber->sid));
-  return overlay_send_probe(subscriber, addr, interface, OQ_MESH_MANAGEMENT);
+    DEBUGF("Loaded address %s for %s", alloca_socket_address(&addr), alloca_tohex_sid_t(subscriber->sid));
+  struct network_destination *destination = create_unicast_destination(&addr, interface);
+  if (!destination)
+    return -1;
+  int ret=overlay_send_probe(subscriber, destination, OQ_MESH_MANAGEMENT);
+  release_destination_ref(destination);
+  return ret;
 }
 
 /* Collection of unicast echo responses to detect working links */
 int
-overlay_mdp_service_probe(overlay_mdp_frame *mdp)
+overlay_mdp_service_probe(struct internal_mdp_header *header, struct overlay_buffer *payload)
 {
   IN();
-  if (mdp->out.src.port!=MDP_PORT_ECHO || mdp->out.payload_length != sizeof(struct probe_contents)){
+  if (header->source_port!=MDP_PORT_ECHO){
     WARN("Probe packets should be returned from remote echo port");
     RETURN(-1);
   }
   
-  struct subscriber *peer = find_subscriber(mdp->out.src.sid, SID_SIZE, 0);
-  if (peer->reachable == REACHABLE_SELF)
+  if (header->source->reachable == REACHABLE_SELF)
     RETURN(0);
   
-  struct probe_contents probe;
-  bcopy(&mdp->out.payload, &probe, sizeof(struct probe_contents));
-  if (probe.addr.sin_family!=AF_INET)
-    RETURN(WHY("Unsupported address family"));
+  uint8_t interface = ob_get(payload);
+  struct socket_address addr;
+  addr.addrlen = ob_remaining(payload);
   
-  struct overlay_interface *interface = &overlay_interfaces[probe.interface];
-  // if a peer is already reachable, and this probe would change the interface, ignore it
-  // TODO track unicast links better in route_link.c
-  if (peer->reachable & REACHABLE_INDIRECT)
-    RETURN(0);
-  if (peer->reachable & REACHABLE_DIRECT && peer->interface && peer->interface != interface)
-    RETURN(0);
-
-  peer->last_probe_response = gettime_ms();
-  peer->interface = &overlay_interfaces[probe.interface];
-  peer->address.sin_family = AF_INET;
-  peer->address.sin_addr = probe.addr.sin_addr;
-  peer->address.sin_port = probe.addr.sin_port;
-  int r=REACHABLE_UNICAST;
-  // Don't turn assumed|broadcast into unicast|broadcast
-  if (!(peer->reachable & REACHABLE_ASSUMED))
-    r |= (peer->reachable & REACHABLE_DIRECT);
-  set_reachable(peer, r);
-  RETURN(0);
+  if (addr.addrlen > sizeof(addr.store))
+    RETURN(-1);
+  
+  ob_get_bytes(payload, (unsigned char*)&addr.addr, addr.addrlen);
+  
+  RETURN(link_unicast_ack(header->source, &overlay_interfaces[interface], &addr));
   OUT();
 }
 
-int overlay_send_probe(struct subscriber *peer, struct sockaddr_in addr, overlay_interface *interface, int queue){
-  if (interface==NULL)
-    interface = overlay_interface_find(addr.sin_addr, 1);
-  
-  if (!interface)
-    return WHY("I don't know which interface to use");
-  
-  if (interface->state!=INTERFACE_STATE_UP)
-    return WHY("I can't send a probe if the interface is down.");
-  
-  // don't send a unicast probe unless its on the same interface that is already known to be reachable
-  if (peer && peer->reachable & REACHABLE_INDIRECT)
-    return -1;
-  if (peer && (peer->reachable & REACHABLE_DIRECT) && peer->interface && peer->interface != interface)
-    return -1;
-
-    if (addr.sin_addr.s_addr==0) {
-      if (config.debug.overlayinterfaces) 
-	DEBUG("I can't send a probe to address 0.0.0.0");
-      return -1;
-    }
-    if (addr.sin_port==0) {
-      if (config.debug.overlayinterfaces) 
-	DEBUG("I can't send a probe to port 0");
-      return -1;
-    }
-  
+int overlay_send_probe(struct subscriber *peer, struct network_destination *destination, int queue){
   // never send unicast probes over a stream interface
-  if (interface->socket_type==SOCK_STREAM)
+  if (destination->interface->socket_type==SOCK_STREAM)
     return 0;
   
   time_ms_t now = gettime_ms();
-  
-  if (peer && peer->last_probe+1000>now)
+  // though unicast probes don't typically use the same network destination, 
+  // we should still try to throttle when we can
+  if (destination->last_tx + destination->tick_ms > now)
     return -1;
+  
+  // TODO enhance overlay_send_frame to support pre-supplied network destinations
   
   struct overlay_frame *frame=malloc(sizeof(struct overlay_frame));
   bzero(frame,sizeof(struct overlay_frame));
@@ -307,169 +245,127 @@ int overlay_send_probe(struct subscriber *peer, struct sockaddr_in addr, overlay
   frame->next_hop = frame->destination = peer;
   frame->ttl=1;
   frame->queue=queue;
-  frame->destination_resolved=1;
-  frame->recvaddr=addr;
-  frame->unicast=1;
-  frame->interface=interface;
-  frame->payload = ob_new();
+  frame->destinations[frame->destination_count++].destination=add_destination_ref(destination);
+  if ((frame->payload = ob_new()) == NULL) {
+    op_free(frame);
+    return -1;
+  }
   frame->source_full = 1;
-  // TODO call mdp payload encryption / signing without calling overlay_mdp_dispatch...
   
-  if (peer)
-    peer->last_probe=gettime_ms();
+  overlay_mdp_encode_ports(frame->payload, MDP_PORT_ECHO, MDP_PORT_PROBE);
   
-  if (overlay_mdp_encode_ports(frame->payload, MDP_PORT_ECHO, MDP_PORT_PROBE)){
-    op_free(frame);
-    return -1;
-  }
-  // not worried about byte order here as we are the only node that should be parsing the contents.
-  unsigned char *dst=ob_append_space(frame->payload, sizeof(struct probe_contents));
-  if (!dst){
-    op_free(frame);
-    return -1;
-  }
-  struct probe_contents probe;
-  probe.addr=addr;
-  // get interface number
-  probe.interface = interface - overlay_interfaces;
-  bcopy(&probe, dst, sizeof(struct probe_contents));
+  ob_append_byte(frame->payload, destination->interface - overlay_interfaces);
+  ob_append_bytes(frame->payload, (uint8_t*)&destination->address.addr, destination->address.addrlen);
+  
   if (overlay_payload_enqueue(frame)){
     op_free(frame);
     return -1;
   }
   if (config.debug.overlayrouting)
-    DEBUGF("Queued probe packet on interface %s to %s:%d for %s", 
-	 interface->name, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), peer?alloca_tohex_sid(peer->sid):"ANY");
+    DEBUGF("Queued probe packet on interface %s to %s for %s", 
+	 destination->interface->name, 
+	 alloca_socket_address(&destination->address), 
+	 peer?alloca_tohex_sid_t(peer->sid):"ANY");
   return 0;
 }
 
 // append the address of a unicast link into a packet buffer
-static int overlay_append_unicast_address(struct subscriber *subscriber, struct overlay_buffer *buff)
+static void overlay_append_unicast_address(struct subscriber *subscriber, struct overlay_buffer *buff)
 {
-  if (subscriber->reachable & REACHABLE_ASSUMED || !(subscriber->reachable & REACHABLE_UNICAST)){
+  if (   subscriber->destination 
+      && subscriber->destination->unicast
+      && subscriber->destination->address.addr.sa_family==AF_INET
+  ) {
+    overlay_address_append(NULL, buff, subscriber);
+    ob_append_ui32(buff, subscriber->destination->address.inet.sin_addr.s_addr);
+    ob_append_ui16(buff, subscriber->destination->address.inet.sin_port);
     if (config.debug.overlayrouting)
-      DEBUGF("Unable to give address of %s, %d", alloca_tohex_sid(subscriber->sid),subscriber->reachable);
-    return 0;
+      DEBUGF("Added STUN info for %s", alloca_tohex_sid_t(subscriber->sid));
+  }else{
+    if (config.debug.overlayrouting)
+      DEBUGF("Unable to give address of %s, %d", alloca_tohex_sid_t(subscriber->sid),subscriber->reachable);
   }
-  
-  if (overlay_address_append(NULL, buff, subscriber))
-    return -1;
-  if (ob_append_ui32(buff, subscriber->address.sin_addr.s_addr))
-    return -1;
-  if (ob_append_ui16(buff, subscriber->address.sin_port))
-    return -1;
-  ob_checkpoint(buff);
-  if (config.debug.overlayrouting)
-    DEBUGF("Added STUN info for %s", alloca_tohex_sid(subscriber->sid));
-  return 0;
 }
 
-// append the address of all neighbour unicast links into a packet buffer
-/*
- static int overlay_append_local_unicasts(struct subscriber *subscriber, void *context)
- {
- struct overlay_buffer *buff = context;
- if ((!subscriber->interface) ||
- (!(subscriber->reachable & REACHABLE_UNICAST)) ||
- (subscriber->reachable & REACHABLE_ASSUMED))
- return 0;
- if ((subscriber->address.sin_addr.s_addr & subscriber->interface->netmask.s_addr) !=
- (subscriber->interface->address.sin_addr.s_addr & subscriber->interface->netmask.s_addr))
- return 0;
- return overlay_append_unicast_address(subscriber, buff);
- }
- */
-
-int overlay_mdp_service_stun_req(overlay_mdp_frame *mdp)
+int overlay_mdp_service_stun_req(struct internal_mdp_header *header, struct overlay_buffer *payload)
 {
   if (config.debug.overlayrouting)
-    DEBUGF("Processing STUN request from %s", alloca_tohex_sid(mdp->out.src.sid));
+    DEBUGF("Processing STUN request from %s", alloca_tohex_sid_t(header->source->sid));
 
-  struct overlay_buffer *payload = ob_static(mdp->out.payload, mdp->out.payload_length);
-  ob_limitsize(payload, mdp->out.payload_length);
+  struct internal_mdp_header reply;
+  bzero(&reply, sizeof reply);
   
-  overlay_mdp_frame reply;
-  bzero(&reply, sizeof(reply));
-  reply.packetTypeAndFlags=MDP_TX;
+  mdp_init_response(header, &reply);
+  reply.qos = OQ_MESH_MANAGEMENT;
   
-  bcopy(mdp->out.src.sid, reply.out.dst.sid, SID_SIZE);
-  bcopy(mdp->out.dst.sid, reply.out.src.sid, SID_SIZE);
-  reply.out.src.port=MDP_PORT_STUNREQ;
-  reply.out.dst.port=MDP_PORT_STUN;
-  reply.out.queue=OQ_MESH_MANAGEMENT;
-  
-  struct overlay_buffer *replypayload = ob_static(reply.out.payload, sizeof(reply.out.payload));
+  struct overlay_buffer *replypayload = ob_new();
+  ob_limitsize(replypayload, MDP_MTU);
   
   ob_checkpoint(replypayload);
-  while(ob_remaining(payload)>0){
+  while (ob_remaining(payload) > 0) {
     struct subscriber *subscriber=NULL;
-    
     if (overlay_address_parse(NULL, payload, &subscriber))
       break;
-    
     if (!subscriber){
       if (config.debug.overlayrouting)
 	DEBUGF("Unknown subscriber");
       continue;
     }
-    
-    if (overlay_append_unicast_address(subscriber, replypayload))
+    overlay_append_unicast_address(subscriber, replypayload);
+    if (ob_overrun(payload))
       break;
+    ob_checkpoint(replypayload);
   }
-  
   ob_rewind(replypayload);
-  reply.out.payload_length=ob_position(replypayload);
   
-  if (reply.out.payload_length){
+  if (ob_position(replypayload)){
     if (config.debug.overlayrouting)
       DEBUGF("Sending reply");
-    overlay_mdp_dispatch(&reply,0 /* system generated */, NULL,0);
+    ob_flip(replypayload);
+    overlay_send_frame(&reply, replypayload);
   }
   ob_free(replypayload);
-  ob_free(payload);
   return 0;
 }
 
-int overlay_mdp_service_stun(overlay_mdp_frame *mdp)
+int overlay_mdp_service_stun(struct internal_mdp_header *header, struct overlay_buffer *payload)
 {
-  struct overlay_buffer *buff = ob_static(mdp->out.payload, mdp->out.payload_length);
-  ob_limitsize(buff, mdp->out.payload_length);
-
   if (config.debug.overlayrouting)
-    DEBUGF("Processing STUN info from %s", alloca_tohex_sid(mdp->out.src.sid));
+    DEBUGF("Processing STUN info from %s", alloca_tohex_sid_t(header->source->sid));
 
-  while(ob_remaining(buff)>0){
+  while(ob_remaining(payload)>0){
     struct subscriber *subscriber=NULL;
-    struct sockaddr_in addr;
     
     // TODO explain addresses, link expiry time, resolve differences between addresses...
     
-    if (overlay_address_parse(NULL, buff, &subscriber)){
+    if (overlay_address_parse(NULL, payload, &subscriber)){
       break;
     }
-    
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ob_get_ui32(buff);
-    addr.sin_port = ob_get_ui16(buff);
+    struct socket_address addr;
+    addr.addrlen = sizeof(addr.inet);
+    addr.inet.sin_family = AF_INET;
+    addr.inet.sin_addr.s_addr = ob_get_ui32(payload);
+    addr.inet.sin_port = ob_get_ui16(payload);
     
     if (!subscriber || (subscriber->reachable!=REACHABLE_NONE))
       continue;
     
-    overlay_send_probe(subscriber, addr, NULL, OQ_MESH_MANAGEMENT);
+    struct network_destination *destination = create_unicast_destination(&addr, NULL);
+    if (destination){
+      overlay_send_probe(subscriber, destination, OQ_MESH_MANAGEMENT);
+      release_destination_ref(destination);
+    }
   }
-  
-  ob_free(buff);
   return 0;
 }
 
 int overlay_send_stun_request(struct subscriber *server, struct subscriber *request){
   if ((!server) || (!request))
     return -1;
-  if (!(subscriber_is_reachable(server)&REACHABLE))
+  if (!(server->reachable&REACHABLE))
     return -1;
   // don't bother with a stun request if the peer is already reachable directly
-  // TODO link timeouts
-  if (subscriber_is_reachable(request)&REACHABLE_DIRECT)
+  if (request->reachable&REACHABLE_DIRECT)
     return -1;
   
   time_ms_t now = gettime_ms();
@@ -478,23 +374,26 @@ int overlay_send_stun_request(struct subscriber *server, struct subscriber *requ
   
   request->last_stun_request=now;
   
-  overlay_mdp_frame mdp;
-  bzero(&mdp, sizeof(mdp));
-  mdp.packetTypeAndFlags=MDP_TX;
+  struct internal_mdp_header header;
+  bzero(&header, sizeof header);
+  header.source = my_subscriber;
+  header.destination = server;
   
-  bcopy(my_subscriber->sid, mdp.out.src.sid, SID_SIZE);
-  bcopy(server->sid, mdp.out.dst.sid, SID_SIZE);
-  mdp.out.src.port=MDP_PORT_STUN;
-  mdp.out.dst.port=MDP_PORT_STUNREQ;
-  mdp.out.queue=OQ_MESH_MANAGEMENT;
+  header.source_port = MDP_PORT_STUN;
+  header.destination_port = MDP_PORT_STUNREQ;
+  header.qos = OQ_MESH_MANAGEMENT;
   
-  struct overlay_buffer *payload = ob_static(mdp.out.payload, sizeof(mdp.out.payload));
+  struct overlay_buffer *payload = ob_new();
+  ob_limitsize(payload, MDP_MTU);
+  
   overlay_address_append(NULL, payload, request);
-  mdp.out.payload_length=ob_position(payload);
-  if (config.debug.overlayrouting)
-    DEBUGF("Sending STUN request to %s", alloca_tohex_sid(server->sid));
-  overlay_mdp_dispatch(&mdp,0 /* system generated */,
-		       NULL,0);
+  if (!ob_overrun(payload)) {
+    if (config.debug.overlayrouting)
+      DEBUGF("Sending STUN request to %s", alloca_tohex_sid_t(server->sid));
+      
+    ob_flip(payload);
+    overlay_send_frame(&header, payload);
+  }
   ob_free(payload);
   return 0;
 }

@@ -19,10 +19,14 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #include "serval.h"
 #include "conf.h"
+#include "socket.h"
 #include "str.h"
 #include "strbuf.h"
+#include "strbuf_helpers.h"
 #include "overlay_buffer.h"
+#include "overlay_interface.h"
 #include "overlay_packet.h"
+
 
 struct sockaddr_in loopback;
 
@@ -35,7 +39,6 @@ struct sockaddr_in loopback;
 
 int overlay_packet_init_header(int packet_version, int encapsulation, 
 			       struct decode_context *context, struct overlay_buffer *buff, 
-			       struct subscriber *destination, 
 			       char unicast, char interface, int seq){
   
   if (packet_version <0 || packet_version > SUPPORTED_PACKET_VERSION)
@@ -43,13 +46,18 @@ int overlay_packet_init_header(int packet_version, int encapsulation,
   if (encapsulation !=ENCAP_OVERLAY && encapsulation !=ENCAP_SINGLE)
     return WHY("Invalid packet encapsulation");
   
-  if (ob_append_byte(buff, packet_version))
-    return -1;
-  if (ob_append_byte(buff, encapsulation))
-    return -1;
-
-  if (overlay_address_append(context, buff, my_subscriber))
-    return -1;
+  ob_append_byte(buff, packet_version);
+  ob_append_byte(buff, encapsulation);
+  
+  if (   context->interface->point_to_point 
+      && context->interface->other_device 
+      && packet_version>=1
+  )
+    context->point_to_point_device = context->interface->other_device;
+  context->encoding_header=1;
+  overlay_address_append(context, buff, my_subscriber);
+  
+  context->encoding_header=0;
   context->sender = my_subscriber;
   
   int flags=0;
@@ -73,9 +81,9 @@ int overlay_packet_init_header(int packet_version, int encapsulation,
 }
 
 // a frame destined for one of our local addresses, or broadcast, has arrived. Process it.
-int process_incoming_frame(time_ms_t now, struct overlay_interface *interface, struct overlay_frame *f, struct decode_context *context){
+int process_incoming_frame(time_ms_t now, struct overlay_interface *UNUSED(interface), struct overlay_frame *f, struct decode_context *context)
+{
   IN();
-  int id = (interface - overlay_interfaces);
   switch(f->type)
   {
     case OF_TYPE_SELFANNOUNCE_ACK:
@@ -83,11 +91,10 @@ int process_incoming_frame(time_ms_t now, struct overlay_interface *interface, s
       break;
       // data frames
     case OF_TYPE_RHIZOME_ADVERT:
-      overlay_rhizome_saw_advertisements(id,f,now);
+      overlay_rhizome_saw_advertisements(context,f);
       break;
     case OF_TYPE_DATA:
-    case OF_TYPE_DATA_VOICE:
-      overlay_saw_mdp_containing_frame(f,now);
+      overlay_saw_mdp_containing_frame(f);
       break;
     case OF_TYPE_PLEASEEXPLAIN:
       process_explain(f);
@@ -111,7 +118,7 @@ int overlay_forward_payload(struct overlay_frame *f){
   
   if (config.debug.verbose && config.debug.overlayframes)
     DEBUGF("Forwarding payload for %s, ttl=%u",
-	  (f->destination?alloca_tohex_sid(f->destination->sid):"broadcast"),
+	  (f->destination?alloca_tohex_sid_t(f->destination->sid):"broadcast"),
 	  (unsigned)f->ttl);
 
   /* Queue frame for dispatch.
@@ -233,7 +240,7 @@ int parseMdpPacketHeader(struct decode_context *context, struct overlay_frame *f
       RETURN(WHY("Unable to read packet seq"));
     // TODO unicast
     if ((flags & PAYLOAD_FLAG_ONE_HOP) || !(flags & PAYLOAD_FLAG_TO_BROADCAST)){
-      if (link_received_duplicate(context->sender, context->interface, context->sender_interface, seq, 0)){
+      if (link_received_duplicate(context->sender, seq)){
         if (config.debug.verbose && config.debug.overlayframes)
           DEBUG("Don't process or forward duplicate payloads");
         forward=process=0;
@@ -254,26 +261,29 @@ int parseMdpPacketHeader(struct decode_context *context, struct overlay_frame *f
 }
 
 int parseEnvelopeHeader(struct decode_context *context, struct overlay_interface *interface, 
-			struct sockaddr_in *addr, struct overlay_buffer *buffer){
+			struct socket_address *addr, struct overlay_buffer *buffer){
   IN();
-  time_ms_t now = gettime_ms();
   
+  context->interface = interface;
+  if (interface->point_to_point && interface->other_device)
+    context->point_to_point_device = interface->other_device;
+  
+  context->sender_interface = 0;
+
   context->packet_version = ob_get(buffer);
+
   if (context->packet_version < 0 || context->packet_version > SUPPORTED_PACKET_VERSION)
-    RETURN(WHY("Packet version not recognised."));
+    RETURN(WHYF("Packet version %d not recognised.", context->packet_version));
   
   context->encapsulation = ob_get(buffer);
   if (context->encapsulation !=ENCAP_OVERLAY && context->encapsulation !=ENCAP_SINGLE)
-    RETURN(WHY("Invalid packet encapsulation"));
+    RETURN(WHYF("Invalid packet encapsulation, %d", context->encapsulation));
   
   if (overlay_address_parse(context, buffer, &context->sender))
     RETURN(WHY("Unable to parse sender"));
   
   int packet_flags = ob_get(buffer);
   
-  context->sender_interface = 0;
-  context->interface = interface;
-
   int sender_seq = -1;
 
   if (packet_flags & PACKET_INTERFACE)
@@ -282,61 +292,38 @@ int parseEnvelopeHeader(struct decode_context *context, struct overlay_interface
   if (packet_flags & PACKET_SEQ)
     sender_seq = ob_get(buffer)&0xFF;
   
+  if (addr)
+    context->addr=*addr;
+
   if (context->sender){
-    // ignore packets that have been reflected back to me
     if (context->sender->reachable==REACHABLE_SELF){
       if (config.debug.verbose && config.debug.overlayframes)
 	DEBUG("Completely ignore packets I sent");
       RETURN(1);
     }
-
-    if (context->sender->max_packet_version < context->packet_version)
-      context->sender->max_packet_version = context->packet_version;
-
-    // TODO probe unicast links when we detect an address change.
     
-    // if this is a dummy announcement for a node that isn't in our routing table
-    if (context->sender->reachable == REACHABLE_NONE) {
-      context->sender->interface = interface;
-      
-      if (addr)
-	context->sender->address = *addr;
-      else
-	bzero(&context->sender->address, sizeof context->sender->address);
-	
-      context->sender->last_probe = 0;
-      
-      // assume for the moment, that we can reply with the same packet type
-      if (packet_flags&PACKET_UNICAST){
-	set_reachable(context->sender, REACHABLE_UNICAST|REACHABLE_ASSUMED);
-      }else{
-	set_reachable(context->sender, REACHABLE_BROADCAST|REACHABLE_ASSUMED);
-      }
+    if (context->packet_version > context->sender->max_packet_version)
+      context->sender->max_packet_version=context->packet_version;
+    
+    if (interface->point_to_point && interface->other_device!=context->sender){
+      INFOF("Established point to point link with %s on %s", alloca_tohex_sid_t(context->sender->sid), interface->name);
+      context->point_to_point_device = context->interface->other_device = context->sender;
     }
     
-    /* Note the probe payload must be queued before any SID/SAS request so we can force the packet to have a full sid */
-    if (addr && (context->sender->last_probe==0 || now - context->sender->last_probe > interface->tick_ms*10))
-      overlay_send_probe(context->sender, *addr, interface, OQ_MESH_MANAGEMENT);
-    
-    link_received_packet(context->sender, interface, context->sender_interface, sender_seq, packet_flags & PACKET_UNICAST);
-  }else{
-    // send a unicast probe, just incase they never hear our broadcasts.
-    if (addr)
-      overlay_send_probe(NULL, *addr, interface, OQ_MESH_MANAGEMENT);
+    if (config.debug.overlayframes)
+      DEBUGF("Received %s packet seq %d from %s on %s", 
+	packet_flags & PACKET_UNICAST?"unicast":"broadcast",
+	sender_seq, alloca_tohex_sid_t(context->sender->sid), interface->name);
   }
   
-  if (addr){
-    if (packet_flags & PACKET_UNICAST)
-      context->addr=*addr;
-    else
-      context->addr=interface->broadcast_address;
-  }
+  link_received_packet(context, sender_seq, packet_flags & PACKET_UNICAST);
+  
   RETURN(0);
   OUT();
 }
 
 int packetOkOverlay(struct overlay_interface *interface,unsigned char *packet, size_t len,
-		    int recvttl, struct sockaddr *recvaddr, size_t recvaddrlen)
+		    struct socket_address *recvaddr)
 {
   IN();
   /* 
@@ -390,8 +377,16 @@ int packetOkOverlay(struct overlay_interface *interface,unsigned char *packet, s
      the source having received the frame from elsewhere.
   */
 
-  if (recvaddr&&recvaddr->sa_family!=AF_INET)
-    RETURN(WHYF("Unexpected protocol family %d",recvaddr->sa_family));
+  if (config.debug.packetrx || interface->debug) {
+    DEBUGF("Received on %s, len %d", interface->name, (int)len);
+    DEBUG_packet_visualise("Received packet",packet,len);
+    if (config.debug.interactive_io) {
+      fprintf(stderr,"Press ENTER to continue..."); fflush(stderr);
+      char buffer[80];
+      if (!fgets(buffer,80,stdin))
+	FATAL_perror("calling fgets");
+    }
+  }
   
   struct overlay_frame f;
   struct decode_context context;
@@ -402,20 +397,15 @@ int packetOkOverlay(struct overlay_interface *interface,unsigned char *packet, s
   struct overlay_buffer *b = ob_static(packet, len);
   ob_limitsize(b, len);
   
-  context.interface = f.interface = interface;
-  if (recvaddr)
-    f.recvaddr = *((struct sockaddr_in *)recvaddr); 
-  else 
-    bzero(&f.recvaddr, sizeof f.recvaddr);
+  f.interface = interface;
   
-  if (config.debug.verbose && config.debug.overlayframes)
-    DEBUG("Received overlay packet");
-  
-  int ret=parseEnvelopeHeader(&context, interface, (struct sockaddr_in *)recvaddr, b);
+  int ret=parseEnvelopeHeader(&context, interface, recvaddr, b);
   if (ret){
     ob_free(b);
     RETURN(ret);
   }
+  f.sender_interface = context.sender_interface;
+  interface->recv_count++;
   
   while(ob_remaining(b)>0){
     context.invalid_addresses=0;
@@ -429,8 +419,8 @@ int packetOkOverlay(struct overlay_interface *interface,unsigned char *packet, s
       break;
     }
     
-    // TODO allow for one byte length?
-    unsigned int payload_len;
+    // TODO allow for single byte length?
+    size_t payload_len;
     
     switch (context.encapsulation){
       case ENCAP_SINGLE:
@@ -442,8 +432,9 @@ int packetOkOverlay(struct overlay_interface *interface,unsigned char *packet, s
 	if (payload_len > ob_remaining(b)){
 	  unsigned char *current = ob_ptr(b)+ob_position(b);
 
-	  dump("Payload Header", header_start, current - header_start);
-	  ret = WHYF("Invalid payload length (%d)", payload_len);
+	  if (config.debug.overlayframes)
+	    dump("Payload Header", header_start, current - header_start);
+	  ret = WHYF("Invalid payload length (%zd)", payload_len);
 	  goto end;
 	}
 	break;
@@ -452,18 +443,18 @@ int packetOkOverlay(struct overlay_interface *interface,unsigned char *packet, s
     int next_payload = ob_position(b) + payload_len;
     
     if (config.debug.overlayframes){
-      DEBUGF("Received payload type %x, len %d", f.type, payload_len);
-      DEBUGF("Payload from %s", f.source?alloca_tohex_sid(f.source->sid):"NULL");
-      DEBUGF("Payload to %s", (f.destination?alloca_tohex_sid(f.destination->sid):"broadcast"));
+      DEBUGF("Received payload type %x, len %zd", f.type, payload_len);
+      DEBUGF("Payload from %s", f.source?alloca_tohex_sid_t(f.source->sid):"NULL");
+      DEBUGF("Payload to %s", (f.destination?alloca_tohex_sid_t(f.destination->sid):"broadcast"));
       if (!is_all_matching(f.broadcast_id.id, BROADCAST_LEN, 0))
 	DEBUGF("Broadcast id %s", alloca_tohex(f.broadcast_id.id, BROADCAST_LEN));
       if (nexthop)
-	DEBUGF("Next hop %s", alloca_tohex_sid(nexthop->sid));
+	DEBUGF("Next hop %s", alloca_tohex_sid_t(nexthop->sid));
     }
     
     if (header_valid!=0){
 
-      f.payload = ob_slice(b, b->position, payload_len);
+      f.payload = ob_slice(b, ob_position(b), payload_len);
       if (!f.payload){
 	// out of memory?
 	WHY("Unable to slice payload");
@@ -480,7 +471,9 @@ int packetOkOverlay(struct overlay_interface *interface,unsigned char *packet, s
       if (header_valid&HEADER_PROCESS)
 	process_incoming_frame(now, interface, &f, &context);
 
-      if (f.next_hop == my_subscriber || f.destination == my_subscriber)
+      // We may need to schedule an ACK / NACK soon when we receive a payload addressed to us, or broadcast
+      if (f.modifiers & PAYLOAD_FLAG_ACK_SOON && 
+	(f.next_hop == my_subscriber || f.destination == my_subscriber || !f.destination))
         link_state_ack_soon(context.sender);
     }
     

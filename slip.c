@@ -1,6 +1,28 @@
+/*
+Serval Distributed Numbering Architecture (DNA)
+Copyright (C) 2012 Paul Gardner-Stephen
+ 
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
+
 #include "serval.h"
 #include "conf.h"
 #include "log.h"
+#include "dataformats.h"
+
+#define DEBUG_packet_visualise(M,P,N) logServalPacket(LOG_LEVEL_DEBUG, __WHENCE__, (M), (P), (N))
 
 /* SLIP-style escape characters used for serial packet radio interfaces */
 #define SLIP_END 0xc0
@@ -21,58 +43,72 @@
 #define DC_VALID 1
 #define DC_ESC 2
 
+static int encode_slip(const unsigned char *src, int src_bytes, unsigned char *dst, int dst_len)
+{
+  int i, offset=0;
+  for (i=0;i<src_bytes;i++){
+    
+    if (offset+3>dst_len)
+      return WHY("Dest buffer full");
+    
+    switch(src[i]) {
+      case SLIP_END:
+	dst[offset++]=SLIP_ESC;
+	dst[offset++]=SLIP_ESC_END;
+	break;
+      case SLIP_ESC:
+	dst[offset++]=SLIP_ESC;
+	dst[offset++]=SLIP_ESC_ESC;
+	break;
+      case SLIP_0a:
+	dst[offset++]=SLIP_ESC;
+	dst[offset++]=SLIP_ESC_0a;
+	break;
+      case SLIP_0d:
+	dst[offset++]=SLIP_ESC;
+	dst[offset++]=SLIP_ESC_0d;
+	break;
+      case SLIP_0f:
+	dst[offset++]=SLIP_ESC;
+	dst[offset++]=SLIP_ESC_0f;
+	break;
+      case SLIP_1b:
+	dst[offset++]=SLIP_ESC;
+	dst[offset++]=SLIP_ESC_1b;
+	break;
+      default:
+	dst[offset++]=src[i];
+    }
+  }
+  return offset;
+}
+
 int slip_encode(int format,
-		unsigned char *src, int src_bytes, unsigned char *dst, int dst_len)
+		const unsigned char *src, int src_bytes, unsigned char *dst, int dst_len)
 {
   switch(format) {
   case SLIP_FORMAT_SLIP:
     {
       int offset=0;
-      int i;
-      
+
       if (offset+2>dst_len)
 	return WHY("Dest buffer full");
       
       dst[offset++]=SLIP_END;
       
-      uint32_t crc=Crc32_ComputeBuf( 0, src, src_bytes);
-      // (I'm assuming there are 4 extra bytes in memory here, which is very naughty...)
-      write_uint32(src+src_bytes, crc);
+      int ret=encode_slip(src, src_bytes, dst + offset, dst_len - offset);
+      if (ret<0)
+	return ret;
+      offset+=ret;
       
-      for (i=0;i<src_bytes+4;i++){
-	
-	if (offset+3>dst_len)
-	  return WHY("Dest buffer full");
-	
-	switch(src[i]) {
-	  case SLIP_END:
-	    dst[offset++]=SLIP_ESC;
-	    dst[offset++]=SLIP_ESC_END;
-	    break;
-	  case SLIP_ESC:
-	    dst[offset++]=SLIP_ESC;
-	    dst[offset++]=SLIP_ESC_ESC;
-	    break;
-	  case SLIP_0a:
-	    dst[offset++]=SLIP_ESC;
-	    dst[offset++]=SLIP_ESC_0a;
-	    break;
-	  case SLIP_0d:
-	    dst[offset++]=SLIP_ESC;
-	    dst[offset++]=SLIP_ESC_0d;
-	    break;
-	  case SLIP_0f:
-	    dst[offset++]=SLIP_ESC;
-	    dst[offset++]=SLIP_ESC_0f;
-	    break;
-	  case SLIP_1b:
-	    dst[offset++]=SLIP_ESC;
-	    dst[offset++]=SLIP_ESC_1b;
-	    break;
-	  default:
-	    dst[offset++]=src[i];
-	}
-      }
+      unsigned char crc[4];
+      write_uint32(crc, Crc32_ComputeBuf( 0, src, src_bytes));
+      
+      ret=encode_slip(crc, 4, dst + offset, dst_len - offset);
+      if (ret<0)
+	return ret;
+      offset+=ret;
+      
       dst[offset++]=SLIP_END;
       
       return offset;
@@ -105,7 +141,7 @@ int slip_encode(int format,
       // Add 32-bit CRC
       // (putting the CRC at the front allows it to be calculated progressively
       // on the receiver side, if we decide to support that)
-      unsigned long crc=Crc32_ComputeBuf( 0, src, src_bytes);
+      uint32_t crc=Crc32_ComputeBuf( 0, src, src_bytes);
       dst[out_len++]=0x80|((crc>>25)&0x7f);
       dst[out_len++]=0x80|((crc>>(25-7))&0x7f);
       dst[out_len++]=0x80|((crc>>(25-7-7))&0x7f);
@@ -149,24 +185,26 @@ int slip_encode(int format,
 
 }
 
-unsigned long long last_rssi_time=0;
+time_ms_t last_rssi_time=0;
 int last_radio_rssi=-999;
 int last_radio_temperature=-999;
+int last_radio_rxpackets=0;
 int parse_rfd900_rssi(char *s)
 {
-  int lrssi,rrssi,lnoise,rnoise,temp;
+  int lrssi,rrssi,lnoise,rnoise,rxpackets,temp;
 
   // L/R RSSI: 48/0  L/R noise: 62/0 pkts: 0  txe=0 rxe=0 stx=0 srx=0 ecc=0/0 temp=21 dco=0
-  if (sscanf(s,"L/R RSSI: %d/%d  L/R noise: %d/%d pkts: %*d  txe=%*d rxe=%*d stx=%*d srx=%*d ecc=%*d/%*d temp=%d dco=%*d",
-	     &lrssi,&rrssi,&lnoise,&rnoise,&temp)==5)
+  if (sscanf(s,"L/R RSSI: %d/%d  L/R noise: %d/%d pkts: %d  txe=%*d rxe=%*d stx=%*d srx=%*d ecc=%*d/%*d temp=%d dco=%*d",
+	     &lrssi,&rrssi,&lnoise,&rnoise,&rxpackets, &temp)==6)
     {
       int lmargin=(lrssi-lnoise)/1.9;
-      int rmargin=(lrssi-lnoise)/1.9;
+      int rmargin=(rrssi-rnoise)/1.9;
       int maxmargin=lmargin; if (rmargin>maxmargin) maxmargin=rmargin;
       last_radio_rssi=maxmargin;
       last_radio_temperature=temp;
+      last_radio_rxpackets=rxpackets;
 
-      if (config.debug.packetradio||(gettime_ms()-last_rssi_time>30000)) {
+      if (gettime_ms()-last_rssi_time>30000) {
 	INFOF("Link budget = %+ddB, temperature=%dC",maxmargin,temp);
 	last_rssi_time=gettime_ms();
       }
@@ -198,10 +236,10 @@ int upper7_decode(struct slip_decode_state *state,unsigned char byte)
     u7d_calls++;
   if (config.debug.slipdecode)
     snprintf(crash_handler_clue,1024,
-	     "upper7_decode() call #%d: state=%d, byte=0x%02x, rssi_len=%d, dst_offset=%d",
+	     "upper7_decode() call #%d: state=%d, byte=0x%02x, rssi_len=%u, dst_offset=%u",
 	     u7d_calls,state->state,byte,state->rssi_len,state->dst_offset);
   if (config.debug.slipbytestream)
-    WHYF("call #%d: state=%d, byte=0x%02x, rssi_len=%d, dst_offset=%d",
+    WHYF("call #%d: state=%d, byte=0x%02x, rssi_len=%u, dst_offset=%u",
 	 u7d_calls,state->state,byte,state->rssi_len,state->dst_offset);
 
   // Parse out inline RSSI reports
@@ -214,13 +252,11 @@ int upper7_decode(struct slip_decode_state *state,unsigned char byte)
     // for CRC verification etc.
     state->state=UPPER7_STATE_NOTINPACKET; RETURN(1);
   } else if (byte>=' '&&byte<=0x7f) {
-    if (state->rssi_len<0) state->rssi_len=0;
     if (state->rssi_len<RSSI_TEXT_SIZE) 
       state->rssi_text[state->rssi_len++]=byte;
     RETURN(0);
   } else if (byte=='\r'||byte=='\n') {
     if (state->rssi_len>=RSSI_TEXT_SIZE) state->rssi_len=RSSI_TEXT_SIZE-1;
-    if (state->rssi_len<0) state->rssi_len=0;
     state->rssi_text[state->rssi_len]=0;
     parse_rfd900_rssi(state->rssi_text);
     state->rssi_len=0;
@@ -236,9 +272,8 @@ int upper7_decode(struct slip_decode_state *state,unsigned char byte)
   byte&=0x7f;
   if (state->packet_length>=OVERLAY_INTERFACE_RX_BUFFER_SIZE
       ||(state->dst_offset+7)>=OVERLAY_INTERFACE_RX_BUFFER_SIZE
-      ||state->dst_offset<0)
-    {
-      WARNF("state=%p, state->dst_offset=%d, ->packet_length=%d, ->state=%d. State reset.",
+  ) {
+      WARNF("state=%p, state->dst_offset=%u, ->packet_length=%u, ->state=%d. State reset.",
 	    state,state->dst_offset,state->packet_length,state->state);
       state->state=UPPER7_STATE_NOTINPACKET;
       state->dst_offset=0;
@@ -256,7 +291,7 @@ int upper7_decode(struct slip_decode_state *state,unsigned char byte)
       state->dst_offset=0;
     } else {
       if (config.debug.packetradio) 
-	DEBUGF("Ignoring jumbo packet of %d bytes",state->packet_length);
+	DEBUGF("Ignoring jumbo packet of %u bytes",state->packet_length);
       state->state=UPPER7_STATE_NOTINPACKET;
     }
     RETURN(0);
@@ -268,9 +303,8 @@ int upper7_decode(struct slip_decode_state *state,unsigned char byte)
   case UPPER7_STATE_D0:
     if (state->packet_length>=OVERLAY_INTERFACE_RX_BUFFER_SIZE
 	||(state->dst_offset+7)>=OVERLAY_INTERFACE_RX_BUFFER_SIZE
-	||state->dst_offset<0)
-      {
-	WARNF("state->dst_offset=%d, ->packet_length=%d, ->state=%d. State reset (again).",
+    ) {
+	WARNF("state->dst_offset=%u, ->packet_length=%u, ->state=%d. State reset (again).",
 	      state->dst_offset,state->packet_length,state->state);
 	state->state=UPPER7_STATE_NOTINPACKET;
 	state->dst_offset=0;
@@ -338,7 +372,7 @@ int slip_decode(struct slip_decode_state *state)
        */
       while(state->src_offset < state->src_size){
 	// clear the valid bit flag if we hit the end of the destination buffer
-	if (state->dst_offset>=sizeof(state->dst))
+	if (state->dst_offset >= sizeof state->dst)
 	  state->state&=~DC_VALID;
 	
 	if (state->state&DC_ESC){
@@ -409,10 +443,9 @@ int slip_decode(struct slip_decode_state *state)
   case SLIP_FORMAT_UPPER7:
     {
       if (config.debug.slip) {
-	if (state->rssi_len<0) state->rssi_len=0;
 	if (state->rssi_len>=RSSI_TEXT_SIZE) state->rssi_len=RSSI_TEXT_SIZE-1;
 	state->rssi_text[state->rssi_len]=0;
-	DEBUGF("RX state=%d, rssi_len=%d, rssi_text='%s',src=%p, src_size=%d",
+	DEBUGF("RX state=%d, rssi_len=%u, rssi_text='%s',src=%p, src_size=%u",
 	       state->state,state->rssi_len,state->rssi_text,
 	       state->src,state->src_size);
       }
@@ -426,14 +459,14 @@ int slip_decode(struct slip_decode_state *state)
 	  uint32_t crc=Crc32_ComputeBuf( 0, state->dst, state->packet_length);
 	  if (crc!=state->crc) {
 	    if (config.debug.packetradio||config.debug.rejecteddata)
-	      DEBUGF("Rejected packet of %d bytes due to CRC mis-match (%08x vs %08x)",
+	      DEBUGF("Rejected packet of %u bytes due to CRC mis-match (%08x vs %08x)",
 		     state->packet_length,crc,state->crc);
 	    if (config.debug.rejecteddata) {
 	      dump("bad packet",state->dst,state->packet_length);
 	    }
 	  } else {
 	    if (config.debug.packetradio) 
-	      DEBUGF("Accepted packet of %d bytes (CRC ok)",state->packet_length);
+	      DEBUGF("Accepted packet of %u bytes (CRC ok)",state->packet_length);
 	    return 1;
 	  }
 	}

@@ -1,9 +1,31 @@
+/* 
+Serval DNA directory service
+Copyright (C) 2013 Serval Project Inc.
 
-#include "constants.h"
-#include "mdp_client.h"
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
+
+#ifdef HAVE_POLL_H
 #include <poll.h>
+#endif
 #include <stdio.h>
 #include <unistd.h>
+#include <inttypes.h>
+#include "constants.h"
+#include "serval.h"
+#include "mdp_client.h"
 #include "str.h"
 
 struct item{
@@ -69,11 +91,11 @@ static void add_item(char *key, char *value){
   fprintf(stderr, "PUBLISHED \"%s\" = \"%s\"\n", key, value);
 }
 
-static void add_record(){
+static void add_record(int mdp_sockfd){
   int ttl;
   overlay_mdp_frame mdp;
   
-  if (overlay_mdp_recv(&mdp, MDP_PORT_DIRECTORY, &ttl))
+  if (overlay_mdp_recv(mdp_sockfd, &mdp, MDP_PORT_DIRECTORY, &ttl))
     return;
   
   if (mdp.packetTypeAndFlags&MDP_NOCRYPT){
@@ -82,15 +104,15 @@ static void add_record(){
   }
   
   // make sure the payload is a NULL terminated string
-  mdp.in.payload[mdp.in.payload_length]=0;
+  mdp.out.payload[mdp.out.payload_length]=0;
   
-  char *did=(char *)mdp.in.payload;
+  char *did=(char *)mdp.out.payload;
   int i=0;
-  while(i<mdp.in.payload_length && mdp.in.payload[i] && mdp.in.payload[i]!='|')
+  while(i<mdp.out.payload_length && mdp.out.payload[i] && mdp.out.payload[i]!='|')
     i++;
-  mdp.in.payload[i]=0;
-  char *name = (char *)mdp.in.payload+i+1;
-  char *sid = alloca_tohex_sid(mdp.in.src.sid);
+  mdp.out.payload[i]=0;
+  char *name = (char *)mdp.out.payload+i+1;
+  char *sid = alloca_tohex_sid_t(mdp.out.src.sid);
   
   // TODO check that did is a valid phone number
   
@@ -158,19 +180,28 @@ static void resolve_request(){
   }
 }
 
-int main(int argc, char **argv){
+int main(void){
   struct pollfd fds[2];
+  int mdp_sockfd;
+
+  if ((mdp_sockfd = overlay_mdp_client_socket()) < 0)
+    return WHY("Cannot create MDP socket");
 
   // bind for incoming directory updates
   sid_t srcsid;
-  if (overlay_mdp_getmyaddr(0, &srcsid))
+    
+  if (overlay_mdp_getmyaddr(mdp_sockfd, 0, &srcsid)) {
+    overlay_mdp_client_close(mdp_sockfd);
     return WHY("Could not get local address");
-  if (overlay_mdp_bind(&srcsid, MDP_PORT_DIRECTORY))
+  }
+  if (overlay_mdp_bind(mdp_sockfd, &srcsid, MDP_PORT_DIRECTORY)) {
+    overlay_mdp_client_close(mdp_sockfd);
     return WHY("Could not bind to MDP socket");
+  }
   
   fds[0].fd = STDIN_FILENO;
   fds[0].events = POLLIN;
-  fds[1].fd = mdp_client_socket;
+  fds[1].fd = mdp_sockfd;
   fds[1].events = POLLIN;
   
   printf("STARTED\n");
@@ -180,15 +211,15 @@ int main(int argc, char **argv){
     int r = poll(fds, 2, 100);
     if (r>0){
       if (fds[0].revents & POLLIN)
-	resolve_request();
+        resolve_request();
       if (fds[1].revents & POLLIN)
-	add_record();
+	add_record(mdp_sockfd);
       
       if (fds[0].revents & (POLLHUP | POLLERR))
 	break;
     }
   }
   
-  overlay_mdp_client_done();
+  overlay_mdp_client_close(mdp_sockfd);
   return 0;
 }

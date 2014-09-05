@@ -41,7 +41,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
     strbuf_init(&b, buf, sizeof buf);
     strbuf_puts(&b, "text");
     strbuf_sprintf(&b, "fmt", val...);
-    if (strbuf_overflow(&b))
+    if (strbuf_overrun(&b))
         // error...
     else
         // use buf
@@ -76,10 +76,13 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
 #include <sys/types.h>
+#include <stdint.h> // for SIZE_MAX on Debian/Unbuntu/...
+#include <limits.h> // for SIZE_MAX on Android
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
 #include <alloca.h>
+#include <assert.h>
 
 #ifndef __STRBUF_INLINE
 # if __GNUC__ && !__GNUC_STDC_INLINE__
@@ -130,9 +133,32 @@ typedef const struct strbuf *const_strbuf;
  */
 #define strbuf_alloca(size) strbuf_make(alloca(SIZEOF_STRBUF + (size)), SIZEOF_STRBUF + (size))
 
+/** Convenience macro that calls strbuf_alloca() to allocate a large enough
+ * buffer to hold the entire content produced by a given expression that
+ * appends to the strbuf.  The first strbuf_alloca() will use the supplied
+ * initial length, and if that overruns, then a second strbuf_alloca() will use
+ * the strbuf_count() from the first pass, so as long as the expression is
+ * stable (ie, always produces the same output), the final assert() will not
+ * be triggered.
+ *
+ *      strbuf b;
+ *      STRBUF_ALLOCA_FIT(b, 20, (strbuf_append_variable_content(b, ...)));
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+#define STRBUF_ALLOCA_FIT(__SB, __INITIAL_LEN, __EXPR) \
+    do { \
+        __SB = strbuf_alloca((__INITIAL_LEN) + 1); \
+        __EXPR; \
+        if (strbuf_overrun(__SB)) { \
+            __SB = strbuf_alloca(strbuf_count(__SB) + 1); \
+            __EXPR; \
+        } \
+        assert(!strbuf_overrun(__SB)); \
+    } while (0)
 
 /** Convenience macro for filling a strbuf from the calling function's
- * printf(3)-like variadic arguments.  See alloca(3) for more information.
+ * printf(3)-like variadic arguments.
  *
  *      #include <stdarg.h>
  *
@@ -147,7 +173,27 @@ typedef const struct strbuf *const_strbuf;
 #define strbuf_va_printf(sb,fmt) do { \
             va_list __strbuf_ap; \
             va_start(__strbuf_ap, fmt); \
-            strbuf_vsprintf(sb, fmt, __strbuf_ap); \
+            strbuf_vsprintf(sb, (fmt), __strbuf_ap); \
+            va_end(__strbuf_ap); \
+        } while (0)
+
+/** Convenience macro for filling a strbuf from the calling function's va_list
+ * variadic argument pointer.
+ *
+ *      #include <stdarg.h>
+ *
+ *      void funcf(const char *format, va_list ap) {
+ *          strbuf b = strbuf_alloca(1024);
+ *          strbuf_va_vprintf(b, format, ap);
+ *          ...
+ *      }
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+#define strbuf_va_vprintf(sb,fmt,ap) do { \
+            va_list __strbuf_ap; \
+            va_copy(__strbuf_ap, (ap)); \
+            strbuf_vsprintf(sb, (fmt), __strbuf_ap); \
             va_end(__strbuf_ap); \
         } while (0)
 
@@ -269,21 +315,22 @@ strbuf strbuf_ncat(strbuf sb, const char *text, size_t len);
 strbuf strbuf_puts(strbuf sb, const char *text);
 
 
-/** Append binary data strbuf, in uppercase hexadecimal format, truncating if
- * necessary to avoid buffer overrun.  Return a pointer to the strbuf.
+/** Append binary data strbuf, as up to 'len' characters of uppercase
+ * hexadecimal format, truncating if necessary to avoid buffer overrun.  Return
+ * a pointer to the strbuf.
  *
  * After these operations:
  *      n = strbuf_len(sb);
  *      c = strbuf_count(sb);
- *      strbuf_tohex(data, len);
+ *      strbuf_tohex(len, data);
  * the following invariants hold:
- *      strbuf_count(sb) == c + len * 2
+ *      strbuf_count(sb) == c + len
  *      strbuf_len(sb) >= n
- *      strbuf_len(sb) <= n + len * 2
+ *      strbuf_len(sb) <= n + len
  *
  * @author Andrew Bettison <andrew@servalproject.com>
  */
-strbuf strbuf_tohex(strbuf sb, const unsigned char *data, size_t len);
+strbuf strbuf_tohex(strbuf sb, size_t strlen, const unsigned char *data);
 
 
 /** Append a single character to the strbuf if there is space, and place a
@@ -314,7 +361,7 @@ strbuf strbuf_putc(strbuf sb, char ch);
  *
  * @author Andrew Bettison <andrew@servalproject.com>
  */
-int strbuf_sprintf(strbuf sb, const char *fmt, ...);
+int strbuf_sprintf(strbuf sb, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 int strbuf_vsprintf(strbuf sb, const char *fmt, va_list ap);
 
 
@@ -421,15 +468,15 @@ __STRBUF_INLINE size_t strbuf_len(const_strbuf sb) {
 }
 
 
-/** Return remaining space in the strbuf, not counting the terminating nul.  Return
- * the maximum possible size_t value if the strbuf is of undefined size.
+/** Return remaining space in the strbuf, not counting the terminating nul.
+ * Return SIZE_MAX if the strbuf is of undefined size.
  *
  * Invariant: strbuf_size(sb) == -1 || strbuf_remaining(sb) == strbuf_size(sb) - strbuf_len(sb)
  *
  * @author Andrew Bettison <andrew@servalproject.com>
  */
 __STRBUF_INLINE size_t strbuf_remaining(const_strbuf sb) {
-  return sb->end ? sb->end - strbuf_end(sb) : ~(size_t)0;
+  return !sb->end ? SIZE_MAX : sb->current > sb->end ? 0 : (size_t)(sb->end - sb->current);
 }
 
 /** Return the number of chars appended to the strbuf so far, not counting the

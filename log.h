@@ -16,8 +16,8 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
-#ifndef __SERVALD_LOG_H
-#define __SERVALD_LOG_H
+#ifndef __SERVAL_DNA__LOG_H
+#define __SERVAL_DNA__LOG_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,12 +100,14 @@ void disable_log_stderr();
 void logFlush();
 void logArgv(int level, struct __sourceloc whence, const char *label, int argc, const char *const *argv);
 void logString(int level, struct __sourceloc whence, const char *str);
-void logMessage(int level, struct __sourceloc whence, const char *fmt, ...);
+void logMessage(int level, struct __sourceloc whence, const char *fmt, ...)
+__attribute__ (( format(printf,3,4) ));
 void vlogMessage(int level, struct __sourceloc whence, const char *fmt, va_list);
 void logConfigChanged();
 int logDump(int level, struct __sourceloc whence, char *name, const unsigned char *addr, size_t len);
 ssize_t get_self_executable_path(char *buf, size_t len);
-int log_backtrace(struct __sourceloc whence);
+int log_backtrace(int level, struct __sourceloc whence);
+
 struct strbuf;
 
 #define __HERE__            ((struct __sourceloc){ .file = __FILE__, .line = __LINE__, .function = __FUNCTION__ })
@@ -151,12 +153,12 @@ struct strbuf;
 #define DEBUG(X)            DEBUGF("%s", (X))
 #define DEBUGF_perror(F,...) LOGF_perror(LOG_LEVEL_DEBUG, F, ##__VA_ARGS__)
 #define DEBUG_perror(X)     DEBUGF_perror("%s", (X))
-#define D                   DEBUG("D")
-#define T                   { if (config.debug.trace) DEBUG("T"); }
+#define D                   (DEBUG("D"), 1)
+#define T                   (config.debug.trace ? DEBUG("T") : 1)
 #define DEBUG_argv(X,ARGC,ARGV) logArgv(LOG_LEVEL_DEBUG, __WHENCE__, (X), (ARGC), (ARGV))
 
 #define dump(X,A,N)         logDump(LOG_LEVEL_DEBUG, __WHENCE__, (X), (const unsigned char *)(A), (size_t)(N))
 
-#define BACKTRACE           log_backtrace(__WHENCE__)
+#define BACKTRACE           log_backtrace(LOG_LEVEL_FATAL, __WHENCE__)
 
-#endif // __SERVALD_LOG_H
+#endif // __SERVAL_DNA__LOG_H

@@ -1,5 +1,6 @@
 /*
-Copyright (C) 2010-2012 Paul Gardner-Stephen, Serval Project.
+Copyright (C) 2010-2012 Paul Gardner-Stephen
+Copyright (C) 2010-2013 Serval Project Inc.
  
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -17,6 +18,35 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
 /*
+  Portions Copyright (C) 2013 Petter Reinholdtsen
+  Some rights reserved
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in
+     the documentation and/or other materials provided with the
+     distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+*/
+
+/*
   Android does unix domain sockets, but only stream sockets, not datagram sockets.
   So we need a separate monitor interface for Android. A bit of a pain, but in
   fact it lets us make a very Android/Java-friendly interface, without any binary
@@ -29,8 +59,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "rhizome.h"
 #include "cli.h"
 #include "str.h"
+#include "strbuf_helpers.h"
 #include "overlay_address.h"
 #include "monitor-client.h"
+#include "socket.h"
+#include "dataformats.h"
 
 #ifdef HAVE_UCRED_H
 #include <ucred.h>
@@ -54,6 +87,7 @@ struct monitor_context {
   
   char line[MONITOR_LINE_LENGTH];
   int line_length;
+#define MONITOR_STATE_UNUSED 0
 #define MONITOR_STATE_COMMAND 1
 #define MONITOR_STATE_DATA 2
   int state;
@@ -63,7 +97,7 @@ struct monitor_context {
 };
 
 #define MAX_MONITOR_SOCKETS 8
-int monitor_socket_count=0;
+unsigned monitor_socket_count=0;
 struct monitor_context monitor_sockets[MAX_MONITOR_SOCKETS];
 
 int monitor_process_command(struct monitor_context *c);
@@ -76,55 +110,30 @@ struct profile_total client_stats;
 
 int monitor_setup_sockets()
 {
-  struct sockaddr_un name;
-  int len;
-  int sock;
-  
-  bzero(&name, sizeof(name));
-  name.sun_family = AF_UNIX;
-  
-  if ((sock = socket(AF_UNIX, SOCK_STREAM, 0))==-1) {
-    WHYF_perror("socket(AF_UNIX, SOCK_STREAM, 0)");
+  int sock = -1;
+  if ((sock = esocket(AF_UNIX, SOCK_STREAM, 0)) == -1)
     goto error;
-  }
-
-  len = monitor_socket_name(&name);
-#ifndef linux
-  unlink(name.sun_path);
-#endif
-
-  if(bind(sock, (struct sockaddr *)&name, len)==-1) {
-    WHYF_perror("bind(%d, %s)", sock, alloca_toprint(-1, &name, len));
+  struct socket_address addr;
+  if (make_local_sockaddr(&addr, "monitor.socket") == -1)
     goto error;
-  }
-  if(listen(sock,MAX_MONITOR_SOCKETS)==-1) {
-    WHYF_perror("listen(%d, %d)", sock, MAX_MONITOR_SOCKETS);
+  if (socket_bind(sock, &addr) == -1)
     goto error;
-  }
-
-  int reuseP=1;
-  if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseP, sizeof reuseP) < 0) {
-    WHYF_perror("setsockopt(%d, SOL_SOCKET, SO_REUSEADDR, &%d, %d)", sock, reuseP, sizeof reuseP);
+  if (socket_listen(sock, MAX_MONITOR_SOCKETS) == -1)
+    goto error;
+  if (socket_set_reuseaddr(sock, 1) == -1)
     WHY("Could not indicate reuse addresses. Not necessarily a problem (yet)");
-  }
-  
-  int send_buffer_size=64*1024;    
-  if(setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &send_buffer_size, sizeof send_buffer_size)==-1)
-    WHYF_perror("setsockopt(%d, SOL_SOCKET, SO_RCVBUF, &%d, %d)", sock, send_buffer_size, sizeof send_buffer_size);
-
-  if (config.debug.io || config.debug.verbose_io)
-    DEBUGF("Monitor server socket bound to %s", alloca_toprint(-1, &name, len));
-
+  socket_set_rcvbufsize(sock, 64 * 1024);
   named_socket.function=monitor_poll;
   named_stats.name="monitor_poll";
   named_socket.stats=&named_stats;
   named_socket.poll.fd=sock;
   named_socket.poll.events=POLLIN;
   watch(&named_socket);
+  INFOF("Monitor socket: fd=%d %s", sock, alloca_socket_address(&addr));
   return 0;
   
-  error:
-  if (sock>=0)
+error:
+  if (sock != -1)
     close(sock);
   return -1;
 }
@@ -166,22 +175,13 @@ void monitor_poll(struct sched_ent *alarm)
 }
 
 static void monitor_close(struct monitor_context *c){
-  struct monitor_context *last;
-  
-  INFO("Tearing down monitor client");
+  INFOF("Tearing down monitor client fd=%d", c->alarm.poll.fd);
   
   unwatch(&c->alarm);
   close(c->alarm.poll.fd);
   c->alarm.poll.fd=-1;
-  
-  monitor_socket_count--;
-  last = &monitor_sockets[monitor_socket_count];
-  if (last != c){
-    unwatch(&last->alarm);
-    bcopy(last, c,
-	  sizeof(struct monitor_context));
-    watch(&c->alarm);
-  }
+  c->state=MONITOR_STATE_UNUSED;
+  c->flags=0;
 }
 
 void monitor_client_poll(struct sched_ent *alarm)
@@ -304,7 +304,7 @@ static void monitor_new_client(int s) {
   ucred_t			*ucred;
 #endif
   uid_t				otheruid;
-  struct monitor_context	*c;
+  struct monitor_context	*c=NULL;
 
   if (set_nonblock(s) == -1)
     goto error;
@@ -318,7 +318,7 @@ static void monitor_new_client(int s) {
     goto error;
   }
   if (len < sizeof(ucred)) {
-    WHYF("getsockopt(SO_PEERCRED) returned the wrong size (Got %d expected %d)", len, sizeof(ucred));
+    WHYF("getsockopt(SO_PEERCRED) returned the wrong size (Got %d expected %d)", len, (int)sizeof(ucred));
     goto error;
   }
   otheruid = ucred.uid;
@@ -347,13 +347,23 @@ static void monitor_new_client(int s) {
       goto error;
     }
   }
-  if (monitor_socket_count >= MAX_MONITOR_SOCKETS
-	     ||monitor_socket_count < 0) {
-    write_str(s, "\nCLOSE:All sockets busy\n");
-    goto error;
+  
+  unsigned i;
+  for (i=0;i<monitor_socket_count;i++){
+    if (monitor_sockets[i].state == MONITOR_STATE_UNUSED){
+      c = &monitor_sockets[i];
+      break;
+    }
   }
   
-  c = &monitor_sockets[monitor_socket_count++];
+  if (!c){
+    if (monitor_socket_count >= MAX_MONITOR_SOCKETS) {
+      write_str(s, "\nCLOSE:All sockets busy\n");
+      goto error;
+    }
+    
+    c = &monitor_sockets[monitor_socket_count++];
+  }
   c->alarm.function = monitor_client_poll;
   client_stats.name = "monitor_client_poll";
   c->alarm.stats=&client_stats;
@@ -383,21 +393,21 @@ void monitor_get_all_supported_codecs(unsigned char *codecs){
   }
 }
 
-static int monitor_announce_all_peers(struct subscriber *subscriber, void *context)
+static int monitor_announce_all_peers(struct subscriber *subscriber, void *UNUSED(context))
 {
   if (subscriber->reachable&REACHABLE)
-    monitor_announce_peer(subscriber->sid);
+    monitor_announce_peer(&subscriber->sid);
   return 0;
 }
 
-static int monitor_set(const struct cli_parsed *parsed, void *context)
+static int monitor_set(const struct cli_parsed *parsed, struct cli_context *context)
 {
-  struct monitor_context *c=context;
+  struct monitor_context *c=context->context;
   if (strcase_startswith(parsed->args[1],"vomp",NULL)){
     c->flags|=MONITOR_VOMP;
     // store the list of supported codecs against the monitor connection,
     // since we need to forget about them when the client disappears.
-    int i;
+    unsigned i;
     for (i = 2; i < parsed->argc; ++i) {
       int codec = atoi(parsed->args[i]);
       if (codec>=0 && codec <=255)
@@ -423,9 +433,9 @@ static int monitor_set(const struct cli_parsed *parsed, void *context)
   return 0;
 }
 
-static int monitor_clear(const struct cli_parsed *parsed, void *context)
+static int monitor_clear(const struct cli_parsed *parsed, struct cli_context *context)
 {
-  struct monitor_context *c=context;
+  struct monitor_context *c=context->context;
   if (strcase_startswith(parsed->args[1],"vomp",NULL))
     c->flags&=~MONITOR_VOMP;
   else if (strcase_startswith(parsed->args[1],"rhizome", NULL))
@@ -446,9 +456,9 @@ static int monitor_clear(const struct cli_parsed *parsed, void *context)
   return 0;
 }
 
-static int monitor_lookup_match(const struct cli_parsed *parsed, void *context)
+static int monitor_lookup_match(const struct cli_parsed *parsed, struct cli_context *context)
 {
-  struct monitor_context *c = context;
+  struct monitor_context *c = context->context;
   const char *sid = parsed->args[2];
   const char *ext = parsed->args[4];
   const char *name = parsed->argc >= 4 ? parsed->args[5] : "";
@@ -456,35 +466,34 @@ static int monitor_lookup_match(const struct cli_parsed *parsed, void *context)
   if (!my_subscriber)
     return monitor_write_error(c,"I don't know who I am");
   
-  struct sockaddr_mdp addr={
-    .port = atoi(parsed->args[3]),
-  };
-  
-  if (stowSid((unsigned char *)&addr.sid, 0, sid)==-1)
+  mdp_port_t dest_port = atoi(parsed->args[3]);
+  sid_t dest;
+  if (str_to_sid_t(&dest, sid) == -1)
     return monitor_write_error(c,"Invalid SID");
+    
+  struct subscriber *destination = find_subscriber(dest.binary, sizeof(dest), 1);
   
   char uri[256];
-  snprintf(uri, sizeof(uri), "sid://%s/external/%s", alloca_tohex_sid(my_subscriber->sid), ext);
+  snprintf(uri, sizeof(uri), "sid://%s/external/%s", alloca_tohex_sid_t(my_subscriber->sid), ext);
   DEBUGF("Sending response to %s for %s", sid, uri);
-  overlay_mdp_dnalookup_reply(&addr, my_subscriber->sid, uri, ext, name);
+  overlay_mdp_dnalookup_reply(destination, dest_port, my_subscriber, uri, ext, name);
   return 0;
 }
 
-static int monitor_call(const struct cli_parsed *parsed, void *context)
+static int monitor_call(const struct cli_parsed *parsed, struct cli_context *context)
 {
-  struct monitor_context *c=context;
-  unsigned char sid[SID_SIZE];
-  if (stowSid(sid, 0, parsed->args[1]) == -1)
+  struct monitor_context *c=context->context;
+  sid_t sid;
+  if (str_to_sid_t(&sid, parsed->args[1]) == -1)
     return monitor_write_error(c,"invalid SID, so cannot place call");
-  
   if (!my_subscriber)
     return monitor_write_error(c,"I don't know who I am");
-  struct subscriber *remote = find_subscriber(sid, SID_SIZE, 1);
+  struct subscriber *remote = find_subscriber(sid.binary, SID_SIZE, 1);
   vomp_dial(my_subscriber, remote, parsed->args[2], parsed->args[3]);
   return 0;
 }
 
-static int monitor_call_ring(const struct cli_parsed *parsed, void *context)
+static int monitor_call_ring(const struct cli_parsed *parsed, struct cli_context *UNUSED(context))
 {
   struct vomp_call_state *call=vomp_find_call_by_session(strtol(parsed->args[1],NULL,16));
   if (!call)
@@ -494,7 +503,7 @@ static int monitor_call_ring(const struct cli_parsed *parsed, void *context)
   return 0;
 }
 
-static int monitor_call_pickup(const struct cli_parsed *parsed, void *context)
+static int monitor_call_pickup(const struct cli_parsed *parsed, struct cli_context *UNUSED(context))
 {
   struct vomp_call_state *call=vomp_find_call_by_session(strtol(parsed->args[1],NULL,16));
   if (!call)
@@ -504,9 +513,9 @@ static int monitor_call_pickup(const struct cli_parsed *parsed, void *context)
   return 0;
 }
 
-static int monitor_call_audio(const struct cli_parsed *parsed, void *context)
+static int monitor_call_audio(const struct cli_parsed *parsed, struct cli_context *context)
 {
-  struct monitor_context *c=context;
+  struct monitor_context *c=context->context;
   struct vomp_call_state *call=vomp_find_call_by_session(strtol(parsed->args[1],NULL,16));
   
   if (!call){
@@ -522,7 +531,7 @@ static int monitor_call_audio(const struct cli_parsed *parsed, void *context)
   return 0;
 }
 
-static int monitor_call_hangup(const struct cli_parsed *parsed, void *context)
+static int monitor_call_hangup(const struct cli_parsed *parsed, struct cli_context *UNUSED(context))
 {
   struct vomp_call_state *call=vomp_find_call_by_session(strtol(parsed->args[1],NULL,16));
   if (!call)
@@ -532,15 +541,15 @@ static int monitor_call_hangup(const struct cli_parsed *parsed, void *context)
   return 0;
 }
 
-static int monitor_call_dtmf(const struct cli_parsed *parsed, void *context)
+static int monitor_call_dtmf(const struct cli_parsed *parsed, struct cli_context *context)
 {
-  struct monitor_context *c=context;
+  struct monitor_context *c=context->context;
   struct vomp_call_state *call=vomp_find_call_by_session(strtol(parsed->args[1],NULL,16));
   if (!call)
     return monitor_write_error(c,"Invalid call token");
   const char *digits = parsed->args[2];
   
-  int i;
+  unsigned i;
   for(i=0;i<strlen(digits);i++) {
     int digit=vomp_parse_dtmf_digit(digits[i]);
     if (digit<0)
@@ -556,7 +565,7 @@ static int monitor_call_dtmf(const struct cli_parsed *parsed, void *context)
   return 0;
 }
 
-static int monitor_help(const struct cli_parsed *parsed, void *context);
+static int monitor_help(const struct cli_parsed *parsed, struct cli_context *context);
 
 struct cli_schema monitor_commands[] = {
   {monitor_help,{"help",NULL},0,""},
@@ -570,7 +579,7 @@ struct cli_schema monitor_commands[] = {
   {monitor_call_audio,{"audio","<token>","<type>","[<time>]","[<sequence>]",NULL},0,""},
   {monitor_call_hangup, {"hangup","<token>",NULL},0,""},
   {monitor_call_dtmf, {"dtmf","<token>","<digits>",NULL},0,""},
-  {NULL},
+  {NULL, {NULL, NULL, NULL, NULL},0,NULL},
 };
 
 int monitor_process_command(struct monitor_context *c) 
@@ -579,14 +588,15 @@ int monitor_process_command(struct monitor_context *c)
   int argc = parse_argv(c->line, ' ', argv, 16);
   
   struct cli_parsed parsed;
-  if (cli_parse(argc, (const char *const*)argv, monitor_commands, &parsed) || cli_invoke(&parsed, c))
+  struct cli_context context={.context=c};
+  if (cli_parse(argc, (const char *const*)argv, monitor_commands, &parsed) || cli_invoke(&parsed, &context))
     return monitor_write_error(c, "Invalid command");
   return 0;
 }
 
-static int monitor_help(const struct cli_parsed *parsed, void *context)
+static int monitor_help(const struct cli_parsed *UNUSED(parsed), struct cli_context *context)
 {
-  struct monitor_context *c=context;
+  struct monitor_context *c=context->context;
   strbuf b = strbuf_alloca(16384);
   strbuf_puts(b, "\nINFO:Usage\n");
   cli_usage(monitor_commands, XPRINTF_STRBUF(b));
@@ -597,9 +607,9 @@ static int monitor_help(const struct cli_parsed *parsed, void *context)
 int monitor_announce_bundle(rhizome_manifest *m)
 {
   char msg[1024];
-  int len = snprintf(msg,1024,"\n*%d:BUNDLE:%s\n",
+  int len = snprintf(msg,1024,"\n*%zd:BUNDLE:%s\n",
            m->manifest_all_bytes,
-	   alloca_tohex_bid(m->cryptoSignPublic));
+	   alloca_tohex_rhizome_bid_t(m->cryptoSignPublic));
   bcopy(m->manifestdata, &msg[len], m->manifest_all_bytes);
   len+=m->manifest_all_bytes;
   msg[len++]='\n';
@@ -607,22 +617,22 @@ int monitor_announce_bundle(rhizome_manifest *m)
   return 0;
 }
 
-int monitor_announce_peer(const unsigned char *sid)
+int monitor_announce_peer(const sid_t *sidp)
 {
-  return monitor_tell_formatted(MONITOR_PEERS, "\nNEWPEER:%s\n", alloca_tohex_sid(sid));
+  return monitor_tell_formatted(MONITOR_PEERS, "\nNEWPEER:%s\n", alloca_tohex_sid_t(*sidp));
 }
 
-int monitor_announce_unreachable_peer(const unsigned char *sid)
+int monitor_announce_unreachable_peer(const sid_t *sidp)
 {
-  return monitor_tell_formatted(MONITOR_PEERS, "\nOLDPEER:%s\n", alloca_tohex_sid(sid));
+  return monitor_tell_formatted(MONITOR_PEERS, "\nOLDPEER:%s\n", alloca_tohex_sid_t(*sidp));
 }
 
 int monitor_announce_link(int hop_count, struct subscriber *transmitter, struct subscriber *receiver)
 {
   return monitor_tell_formatted(MONITOR_LINKS, "\nLINK:%d:%s:%s\n", 
     hop_count,
-    transmitter?alloca_tohex_sid(transmitter->sid):"",
-    alloca_tohex_sid(receiver->sid));
+    transmitter ? alloca_tohex_sid_t(transmitter->sid) : "",
+    alloca_tohex_sid_t(receiver->sid));
 }
 
 // test if any monitor clients are interested in a particular type of event

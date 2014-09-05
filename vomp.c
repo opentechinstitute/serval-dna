@@ -24,12 +24,16 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 */
 
+#include <assert.h>
 #include "serval.h"
 #include "str.h"
 #include "conf.h"
 #include "strbuf.h"
 #include "strlcpy.h"
+#include "mdp_client.h"
 #include "overlay_address.h"
+#include "overlay_buffer.h"
+#include "overlay_packet.h"
 
 /*
  Typical call state lifecycle between 2 parties.
@@ -171,7 +175,7 @@ struct vomp_call_state {
   time_ms_t create_time;
   time_ms_t last_activity;
   time_ms_t audio_clock;
-  int remote_audio_clock;
+  unsigned remote_audio_clock;
   
   // last local & remote status we sent to all interested parties
   int last_sent_status;
@@ -184,7 +188,7 @@ struct vomp_call_state {
  This is partly to deal with denial of service attacks that might occur by causing
  the ejection of newly allocated session numbers before the caller has had a chance
  to progress the call to a further state. */
-int vomp_call_count=0;
+unsigned vomp_call_count=0;
 // TODO allocate call structures dynamically
 struct vomp_call_state vomp_call_states[VOMP_MAX_CALLS];
 struct profile_total vomp_stats;
@@ -329,9 +333,9 @@ int is_codec_set(int codec, unsigned char *flags){
   return flags[codec >> 3] & (1<<(codec & 7));
 }
 
-struct vomp_call_state *vomp_find_call_by_session(int session_token)
+struct vomp_call_state *vomp_find_call_by_session(unsigned int session_token)
 {
-  int i;
+  unsigned i;
   for(i=0;i<vomp_call_count;i++)
     if (session_token==vomp_call_states[i].local.session)
       return &vomp_call_states[i];
@@ -340,14 +344,14 @@ struct vomp_call_state *vomp_find_call_by_session(int session_token)
 
 static int vomp_generate_session_id()
 {
-  int session_id=0;
+  unsigned int session_id=0;
   while (!session_id)
   {
-    if (urandombytes((unsigned char *)&session_id,sizeof(int)))
+    if (urandombytes((unsigned char *)&session_id, sizeof session_id))
       return WHY("Insufficient entropy");
     session_id&=VOMP_SESSION_MASK;
     if (config.debug.vomp) DEBUGF("session=0x%08x",session_id);
-    int i;
+    unsigned i;
     /* reject duplicate call session numbers */
     for(i=0;i<vomp_call_count;i++)
       if (session_id==vomp_call_states[i].local.session
@@ -399,11 +403,10 @@ static struct vomp_call_state *vomp_find_or_create_call(struct subscriber *remot
 					  int sender_state,
 					  int recvr_state)
 {
-  int i;
   struct vomp_call_state *call;
-  
   if (config.debug.vomp)
-    DEBUGF("%d calls already in progress.",vomp_call_count);
+    DEBUGF("%u calls already in progress.",vomp_call_count);
+  unsigned i;
   for(i=0;i<vomp_call_count;i++)
     {
       call = &vomp_call_states[i];
@@ -461,20 +464,18 @@ static struct vomp_call_state *vomp_find_or_create_call(struct subscriber *remot
   return NULL;
 }
 
-static void prepare_vomp_header(struct vomp_call_state *call, overlay_mdp_frame *mdp){
-  mdp->packetTypeAndFlags=MDP_TX;
-  bcopy(call->local.subscriber->sid,mdp->out.src.sid,SID_SIZE);
-  mdp->out.src.port=MDP_PORT_VOMP;
-  bcopy(call->remote.subscriber->sid,mdp->out.dst.sid,SID_SIZE);
-  mdp->out.dst.port=MDP_PORT_VOMP;
+static void prepare_vomp_header(
+  struct vomp_call_state *call, struct internal_mdp_header *header, struct overlay_buffer *payload)
+{
+  header->source = call->local.subscriber;
+  header->source_port = MDP_PORT_VOMP;
+  header->destination = call->remote.subscriber;
+  header->destination_port = MDP_PORT_VOMP;
   
-  mdp->out.payload[0]=VOMP_VERSION;
-  mdp->out.payload[1]=(call->local.session>>8)&0xff;
-  mdp->out.payload[2]=(call->local.session>>0)&0xff;
-  mdp->out.payload[3]=(call->remote.session>>8)&0xff;
-  mdp->out.payload[4]=(call->remote.session>>0)&0xff;
-  mdp->out.payload[5]=(call->remote.state<<4)|call->local.state;
-  mdp->out.payload_length=6;
+  ob_append_byte(payload, VOMP_VERSION);
+  ob_append_ui16(payload, call->local.session);
+  ob_append_ui16(payload, call->remote.session);
+  ob_append_byte(payload, (call->remote.state<<4)|call->local.state);
   
   // keep trying to punch a NAT tunnel for 10s
   // note that requests are rate limited internally to one packet per second
@@ -488,14 +489,16 @@ static void prepare_vomp_header(struct vomp_call_state *call, overlay_mdp_frame 
 
 static int vomp_send_status_remote(struct vomp_call_state *call)
 {
-  overlay_mdp_frame mdp;
-  unsigned short  *len=&mdp.out.payload_length;
+  struct internal_mdp_header header;
+  bzero(&header, sizeof(header));
   
-  bzero(&mdp,sizeof(mdp));
-  prepare_vomp_header(call, &mdp);
-  mdp.out.queue=OQ_ORDINARY;
+  uint8_t buff[MDP_MTU];
+  struct overlay_buffer *payload = ob_static(buff, sizeof buff);
+  
+  prepare_vomp_header(call, &header, payload);
+  header.qos = OQ_ORDINARY;
+  
   if (call->local.state < VOMP_STATE_RINGINGOUT && call->remote.state < VOMP_STATE_RINGINGOUT) {
-    int didLen;
     unsigned char codecs[CODEC_FLAGS_LENGTH];
     
     /* Include the list of supported codecs */
@@ -503,33 +506,36 @@ static int vomp_send_status_remote(struct vomp_call_state *call)
     
     int i;
     for (i = 0; i < 256; ++i)
-      if (is_codec_set(i,codecs)) {
-	mdp.out.payload[(*len)++]=i;
-      }
-    mdp.out.payload[(*len)++]=0;
+      if (is_codec_set(i,codecs))
+	ob_append_byte(payload, i);
+    
+    ob_append_byte(payload, 0);
     
     /* Include src and dst phone numbers */
     if (call->initiated_call){
-      DEBUGF("Sending phone numbers %s, %s",call->local.did,call->remote.did);
-      didLen = snprintf((char *)(mdp.out.payload + *len), sizeof(mdp.out.payload) - *len, "%s", call->local.did);
-      *len+=didLen+1;
-      didLen = snprintf((char *)(mdp.out.payload + *len), sizeof(mdp.out.payload) - *len, "%s", call->remote.did);
-      *len+=didLen+1;
+      if (config.debug.vomp)
+	DEBUGF("Sending phone numbers %s, %s",call->local.did,call->remote.did);
+      ob_append_str(payload, call->local.did);
+      ob_append_str(payload, call->remote.did);
     }
     
     if (config.debug.vomp)
-      DEBUGF("mdp frame with codec list is %d bytes", mdp.out.payload_length);
+      DEBUGF("mdp frame with codec list is %zd bytes", ob_position(payload));
   }
 
   call->local.sequence++;
   
-  overlay_mdp_dispatch(&mdp,0,NULL,0);
+  ob_flip(payload);
+  if (config.debug.vomp)
+    ob_dump(payload, "payload");
+  overlay_send_frame(&header, payload);
+  ob_free(payload);
   
   return 0;
 }
 
 int vomp_received_audio(struct vomp_call_state *call, int audio_codec, int time, int sequence,
-			const unsigned char *audio, int audio_length)
+			const uint8_t *audio, int audio_length)
 {
   if (call->local.state!=VOMP_STATE_INCALL)
     return -1;
@@ -543,25 +549,26 @@ int vomp_received_audio(struct vomp_call_state *call, int audio_codec, int time,
   if (sequence==-1)
     sequence = call->local.sequence++;
   
-  overlay_mdp_frame mdp;
-  unsigned short  *len=&mdp.out.payload_length;
+  struct internal_mdp_header header;
+  bzero(&header, sizeof(header));
   
-  bzero(&mdp,sizeof(mdp));
-  prepare_vomp_header(call, &mdp);
+  uint8_t buff[MDP_MTU];
+  struct overlay_buffer *payload = ob_static(buff, sizeof buff);
   
-  mdp.out.payload[(*len)++]=audio_codec;
+  prepare_vomp_header(call, &header, payload);
+  header.qos = OQ_ISOCHRONOUS_VOICE;
+
+  ob_append_byte(payload, audio_codec);
   time = time / 20;
-  mdp.out.payload[(*len)++]=(time>>8)&0xff;
-  mdp.out.payload[(*len)++]=(time>>0)&0xff;
-  mdp.out.payload[(*len)++]=(sequence>>8)&0xff;
-  mdp.out.payload[(*len)++]=(sequence>>0)&0xff;
+  ob_append_ui16(payload, time);
+  ob_append_ui16(payload, sequence);
+  ob_append_bytes(payload, audio, audio_length);
   
-  bcopy(audio,&mdp.out.payload[(*len)],audio_length);
-  (*len)+=audio_length;
-    
-  mdp.out.queue=OQ_ISOCHRONOUS_VOICE;
-  
-  overlay_mdp_dispatch(&mdp,0,NULL,0);
+  ob_flip(payload);
+  if (config.debug.vomp)
+    ob_dump(payload, "payload");
+  overlay_send_frame(&header, payload);
+  ob_free(payload);
   
   return 0;
 }
@@ -573,8 +580,8 @@ static int monitor_call_status(struct vomp_call_state *call)
 	   call->local.session,call->remote.session,
 	   call->local.state,call->remote.state,
 	   0,
-	   alloca_tohex_sid(call->local.subscriber->sid),
-	   alloca_tohex_sid(call->remote.subscriber->sid),
+	   alloca_tohex_sid_t(call->local.subscriber->sid),
+	   alloca_tohex_sid_t(call->remote.subscriber->sid),
 	   call->local.did,call->remote.did);
   
   monitor_tell_clients(msg, n, MONITOR_VOMP);
@@ -636,8 +643,8 @@ static int vomp_update_local_state(struct vomp_call_state *call, int new_state){
       // tell client our session id.
       monitor_tell_formatted(MONITOR_VOMP, "\nCALLTO:%06x:%s:%s:%s:%s\n", 
 			     call->local.session, 
-			     alloca_tohex_sid(call->local.subscriber->sid), call->local.did,
-			     alloca_tohex_sid(call->remote.subscriber->sid), call->remote.did);
+			     alloca_tohex_sid_t(call->local.subscriber->sid), call->local.did,
+			     alloca_tohex_sid_t(call->remote.subscriber->sid), call->remote.did);
       break;
     case VOMP_STATE_CALLENDED:
       monitor_tell_formatted(MONITOR_VOMP, "\nHANGUP:%06x\n", call->local.session);
@@ -657,8 +664,8 @@ static int vomp_update_remote_state(struct vomp_call_state *call, int new_state)
     case VOMP_STATE_RINGINGOUT:
       monitor_tell_formatted(MONITOR_VOMP, "\nCALLFROM:%06x:%s:%s:%s:%s\n", 
 			     call->local.session, 
-			     alloca_tohex_sid(call->local.subscriber->sid), call->local.did,
-			     alloca_tohex_sid(call->remote.subscriber->sid), call->remote.did);
+			     alloca_tohex_sid_t(call->local.subscriber->sid), call->local.did,
+			     alloca_tohex_sid_t(call->remote.subscriber->sid), call->remote.did);
       break;
     case VOMP_STATE_RINGINGIN:
       monitor_tell_formatted(MONITOR_VOMP, "\nRINGING:%06x\n", call->local.session);
@@ -691,41 +698,35 @@ static int vomp_update(struct vomp_call_state *call)
   vomp_send_status_remote(call);
   
   // tell monitor clients
-  if (monitor_socket_count && monitor_client_interested(MONITOR_VOMP))
+  if (monitor_client_interested(MONITOR_VOMP))
     monitor_call_status(call);
   
   return 0;
 }
 
-static int to_absolute_value(int short_value, int reference_value){
-  short_value = (reference_value & 0xFFFF0000) | short_value;
-  
-  if (short_value + 0x8000 < reference_value)
-    short_value+=0x10000;
-  
-  if (short_value > reference_value + 0x8000)
-    short_value-=0x10000;
-  
-  return short_value;
+static uint32_t to_absolute_value(uint16_t short_value, unsigned int reference_value)
+{
+  uint32_t abs_value = (reference_value & 0xFFFF0000) | short_value;
+  if (abs_value + 0x8000 < reference_value)
+    abs_value += 0x10000;
+  if (abs_value > reference_value + 0x8000)
+    abs_value -= 0x10000;
+  return abs_value;
 }
 
-static int vomp_process_audio(struct vomp_call_state *call, overlay_mdp_frame *mdp, time_ms_t now)
+static int vomp_process_audio(struct vomp_call_state *call, struct overlay_buffer *payload, time_ms_t now)
 {
-  int ofs=6;
-
-  if(ofs>=mdp->in.payload_length)
+  if(ob_remaining(payload)<1)
     return 0;
   
-  int codec=mdp->in.payload[ofs++];
+  uint8_t codec=ob_get(payload);
   
-  int time = mdp->in.payload[ofs]<<8 | mdp->in.payload[ofs+1]<<0;
-  ofs+=2;
-  int sequence = mdp->in.payload[ofs]<<8 | mdp->in.payload[ofs+1]<<0;
-  ofs+=2;
+  uint16_t time = ob_get_ui16(payload);
+  uint16_t sequence = ob_get_ui16(payload);
   
   // rebuild absolute time value from short relative time.
-  int decoded_time = to_absolute_value(time, call->remote_audio_clock);
-  int decoded_sequence = to_absolute_value(sequence, call->remote.sequence);
+  uint32_t decoded_time = to_absolute_value(time, call->remote_audio_clock);
+  uint32_t decoded_sequence = to_absolute_value(sequence, call->remote.sequence);
   
   if (call->remote_audio_clock < decoded_time &&
     call->remote.sequence < decoded_sequence){
@@ -733,7 +734,7 @@ static int vomp_process_audio(struct vomp_call_state *call, overlay_mdp_frame *m
     call->remote.sequence = decoded_sequence;
   }else if (call->remote_audio_clock < decoded_time ||
     call->remote.sequence < decoded_sequence){
-    WARNF("Mismatch while decoding sequence and time offset (%d, %d) + (%d, %d) = (%d, %d)",
+    WARNF("Mismatch while decoding sequence and time offset (%u, %u) + (%u, %u) = (%u, %u)",
 	time, sequence,
 	call->remote_audio_clock, call->remote.sequence,
 	decoded_time, decoded_sequence);
@@ -741,17 +742,16 @@ static int vomp_process_audio(struct vomp_call_state *call, overlay_mdp_frame *m
 
   decoded_time=decoded_time * 20;
   
-  int audio_len = mdp->in.payload_length - ofs;
+  int audio_len = ob_remaining(payload);
   int delay=0;
   
   if (store_jitter_sample(&call->jitter, decoded_time, now, &delay))
     return 0;
   
   /* Pass audio frame to all registered listeners */
-  if (monitor_socket_count)
-    monitor_send_audio(call, codec, decoded_time, decoded_sequence,
-		       &mdp->in.payload[ofs],
-		       audio_len, delay);
+  monitor_send_audio(call, codec, decoded_time, decoded_sequence,
+		     ob_current_ptr(payload),
+		     audio_len, delay);
   return 0;
 }
 
@@ -774,11 +774,12 @@ static int vomp_call_destroy(struct vomp_call_state *call)
     DEBUGF("Destroying call %06x:%06x [%s,%s]", call->local.session, call->remote.session, call->local.did,call->remote.did);
   
   /* now release the call structure */
-  int i = (call - vomp_call_states);
+  unsigned i = (call - vomp_call_states);
   unschedule(&call->alarm);
   call->local.session=0;
   call->remote.session=0;
   
+  assert(vomp_call_count > 0);
   vomp_call_count--;
   if (i!=vomp_call_count){
     unschedule(&vomp_call_states[vomp_call_count].alarm);
@@ -853,23 +854,23 @@ int vomp_hangup(struct vomp_call_state *call)
   return 0;
 }
 
-static int vomp_extract_remote_codec_list(struct vomp_call_state *call,overlay_mdp_frame *mdp)
+static int vomp_extract_remote_codec_list(struct vomp_call_state *call, struct overlay_buffer *payload)
 {
-  int ofs=6;
-  
   if (config.debug.vomp)
-    dump("codec list mdp frame", (unsigned char *)&mdp->in.payload[0],mdp->in.payload_length);
+    ob_dump(payload, "codec list mdp frame");
   
-  for (;ofs<mdp->in.payload_length && mdp->in.payload[ofs];ofs++){
-    int codec = mdp->in.payload[ofs];
+  while(ob_remaining(payload)>0){
+    uint8_t codec = ob_get(payload);
     set_codec_flag(codec, call->remote_codec_flags);
   }
+  
   if (!call->initiated_call){
-    ofs++;
-    if (ofs<mdp->in.payload_length)
-      ofs+=strlcpy(call->remote.did, (char *)(mdp->in.payload+ofs), sizeof(call->remote.did))+1;
-    if (ofs<mdp->in.payload_length)
-      ofs+=strlcpy(call->local.did, (char *)(mdp->in.payload+ofs), sizeof(call->local.did));
+    const char *p;
+    if (ob_remaining(payload)>0 && (p=ob_get_str_ptr(payload))){
+      strlcpy(call->remote.did, p, sizeof(call->remote.did));
+      if (ob_remaining(payload)>0 && (p=ob_get_str_ptr(payload)))
+	strlcpy(call->local.did, p, sizeof(call->local.did));
+    }
   }
   return 0;
 }
@@ -877,27 +878,25 @@ static int vomp_extract_remote_codec_list(struct vomp_call_state *call,overlay_m
 /* At this point we know the MDP frame is addressed to the VoMP port, but 
    we have not inspected the contents. As these frames are wire-format, we
    must pay attention to endianness. */
-int vomp_mdp_received(overlay_mdp_frame *mdp)
+int vomp_mdp_received(struct internal_mdp_header *header, struct overlay_buffer *payload)
 {
   time_ms_t now = gettime_ms();
   
-  if (mdp->packetTypeAndFlags&(MDP_NOCRYPT|MDP_NOSIGN))
-    {
-      /* stream-crypted audio frame */
-      return WHY("not implemented");
-    }
-
-  /* only auth-crypted frames make it this far */
+  if (header->crypt_flags & (MDP_FLAG_NO_CRYPT | MDP_FLAG_NO_SIGN))
+    return WHY("not implemented");
+  
+  /* only auth-crypted frames are allowed */
 
   struct vomp_call_state *call=NULL;
-
-  switch(mdp->in.payload[0]) {
+  unsigned char version = ob_get(payload);
+  switch(version) {
   case VOMP_VERSION:
     {
-      unsigned int sender_session=(mdp->in.payload[1]<<8)|mdp->in.payload[2];
-      unsigned int recvr_session=(mdp->in.payload[3]<<8)|mdp->in.payload[4];
-      int recvr_state=mdp->in.payload[5]>>4;
-      int sender_state=mdp->in.payload[5]&0xf;
+      unsigned int sender_session=ob_get_ui16(payload);
+      unsigned int recvr_session=ob_get_ui16(payload);
+      unsigned char state = ob_get(payload);
+      unsigned char recvr_state=state>>4;
+      unsigned char sender_state=state&0xf;
       
       /* wants to create a call session.
        Main aim here: replay protection. An adversary should not be able to
@@ -906,10 +905,8 @@ int vomp_mdp_received(overlay_mdp_frame *mdp)
        trying to use such replays to cause a denial of service attack we need
        to be able to track multiple potential session numbers even from the
        same SID. */
-      struct subscriber *local=find_subscriber(mdp->in.dst.sid, SID_SIZE, 0);
-      struct subscriber *remote=find_subscriber(mdp->in.src.sid, SID_SIZE, 0);
       
-      call=vomp_find_or_create_call(remote,local,
+      call=vomp_find_or_create_call(header->source, header->destination,
 				    sender_session,recvr_session,
 				    sender_state,recvr_state);
       
@@ -927,8 +924,7 @@ int vomp_mdp_received(overlay_mdp_frame *mdp)
       // Though we could use this information to indicate a network error.
       recvr_state = call->local.state;
       
-      if ((!monitor_socket_count)
-	  &&(!monitor_client_interested(MONITOR_VOMP)))
+      if (!monitor_client_interested(MONITOR_VOMP))
       {
 	/* No registered listener, so we cannot answer the call, so just reject
 	   it. */
@@ -946,7 +942,7 @@ int vomp_mdp_received(overlay_mdp_frame *mdp)
 	int i, found=0;
 	
 	// the other party should have given us their list of supported codecs
-	vomp_extract_remote_codec_list(call,mdp);
+	vomp_extract_remote_codec_list(call, payload);
 	
 	// make sure we have at least one codec in common
 	monitor_get_all_supported_codecs(supported_codecs);
@@ -1049,7 +1045,7 @@ int vomp_mdp_received(overlay_mdp_frame *mdp)
 	// Fall through
       case (VOMP_STATE_INCALL<<3)|VOMP_STATE_INCALL:
 	/* play any audio that they have sent us. */
-	vomp_process_audio(call,mdp,now);
+	vomp_process_audio(call, payload, now);
 	break;
 	  
       case (VOMP_STATE_CALLENDED<<3)|VOMP_STATE_NOCALL:
@@ -1084,7 +1080,7 @@ int vomp_mdp_received(overlay_mdp_frame *mdp)
     break;
   default:
     /* unsupported VoMP frame */
-    WHYF("Unsupported VoMP frame type = 0x%02x",mdp->in.payload[0]);
+    WHYF("Unsupported VoMP frame type = 0x%02x", version);
     break;
   }
 

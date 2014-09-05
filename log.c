@@ -1,5 +1,5 @@
 /*
-Serval DNA logging.
+Serval DNA logging
 Copyright 2013 Serval Project Inc.
 
 This program is free software; you can redistribute it and/or
@@ -238,7 +238,7 @@ static void _log_prefix(_log_iterator *it, int level)
       if (strftime(buf, sizeof buf, "%T", &it->tm) == 0)
 	xputs("EMPTYTIME___ ", it->xpf);
       else
-	xprintf(it->xpf, "%s.%03u ", buf, it->tv.tv_usec / 1000);
+	xprintf(it->xpf, "%s.%03u ", buf, (unsigned int)it->tv.tv_usec / 1000);
     }
   }
 }
@@ -271,7 +271,7 @@ static void _log_prefix_whence(_log_iterator *it, struct __sourceloc whence)
   }
 }
 
-static void _log_end_line(_log_iterator *it, int level)
+static void _log_end_line(_log_iterator *it, int UNUSED(level))
 {
 #ifdef ANDROID
   if (it->config == &config.log.android) {
@@ -667,7 +667,7 @@ void logString(int level, struct __sourceloc whence, const char *str)
 	_log_iterator_rewind(&it);
 	while (_log_iterator_next(&it, level)) {
 	  _log_prefix_whence(&it, whence);
-	  xprintf(it.xpf, "%.*s", p - s, s);
+	  xprintf(it.xpf, "%.*s", (int)(p - s), s);
 	}
 	s = p + 1;
       }
@@ -676,7 +676,7 @@ void logString(int level, struct __sourceloc whence, const char *str)
       _log_iterator_rewind(&it);
       while (_log_iterator_next(&it, level)) {
 	_log_prefix_whence(&it, whence);
-	xprintf(it.xpf, "%.*s", p - s, s);
+	xprintf(it.xpf, "%.*s", (int)(p - s), s);
       }
     }
   }
@@ -717,30 +717,6 @@ void logConfigChanged()
   logFlush();
 }
 
-int logDump(int level, struct __sourceloc whence, char *name, const unsigned char *addr, size_t len)
-{
-  if (level != LOG_LEVEL_SILENT) {
-    char buf[100];
-    size_t i;
-    if (name)
-      logMessage(level, whence, "Dump of %s", name);
-    for(i = 0; i < len; i += 16) {
-      strbuf b = strbuf_local(buf, sizeof buf);
-      strbuf_sprintf(b, "  %04x :", i);
-      int j;
-      for (j = 0; j < 16 && i + j < len; j++)
-	strbuf_sprintf(b, " %02x", addr[i + j]);
-      for (; j < 16; j++)
-	strbuf_puts(b, "   ");
-      strbuf_puts(b, "    ");
-      for (j = 0; j < 16 && i + j < len; j++)
-	strbuf_sprintf(b, "%c", addr[i+j] >= ' ' && addr[i+j] < 0x7f ? addr[i+j] : '.');
-      logMessage(level, whence, "%s", strbuf_str(b));
-    }
-  }
-  return 0;
-}
-
 ssize_t get_self_executable_path(char *buf, size_t len)
 {
 #if defined(linux)
@@ -755,7 +731,7 @@ ssize_t get_self_executable_path(char *buf, size_t len)
 #endif
 }
 
-int log_backtrace(struct __sourceloc whence)
+int log_backtrace(int level, struct __sourceloc whence)
 {
 #ifndef NO_BACKTRACE
   _log_iterator it;
@@ -812,7 +788,7 @@ int log_backtrace(struct __sourceloc whence)
   }
   // parent
   close(stdout_fds[1]);
-  _log_iterator_printf_nl(&it, LOG_LEVEL_DEBUG, whence, "GDB BACKTRACE");
+  _log_iterator_printf_nl(&it, level, whence, "GDB BACKTRACE");
   char buf[1024];
   char *const bufe = buf + sizeof buf;
   char *linep = buf;
@@ -824,14 +800,14 @@ int log_backtrace(struct __sourceloc whence)
     for (; p < readp; ++p)
       if (*p == '\n' || *p == '\0') {
 	*p = '\0';
-	_log_iterator_printf_nl(&it, LOG_LEVEL_DEBUG, __NOWHERE__, "%s", linep);
+	_log_iterator_printf_nl(&it, level, __NOWHERE__, "%s", linep);
 	linep = p + 1;
       }
     if (readp >= bufe && linep == buf) {
       // Line does not fit into buffer.
       char t = bufe[-1];
       bufe[-1] = '\0';
-      _log_iterator_printf_nl(&it, LOG_LEVEL_DEBUG, __NOWHERE__, "%s", buf);
+      _log_iterator_printf_nl(&it, level, __NOWHERE__, "%s", buf);
       buf[0] = t;
       readp = buf + 1;
     } else if (readp + 120 >= bufe && linep != buf) {
@@ -847,7 +823,7 @@ int log_backtrace(struct __sourceloc whence)
     WHY_perror("read");
   if (readp > linep) {
     *readp = '\0';
-    _log_iterator_printf_nl(&it, LOG_LEVEL_DEBUG, __NOWHERE__, "%s", linep);
+    _log_iterator_printf_nl(&it, level, __NOWHERE__, "%s", linep);
   }
   close(stdout_fds[0]);
   int status = 0;
@@ -855,36 +831,8 @@ int log_backtrace(struct __sourceloc whence)
     WHY_perror("waitpid");
   strbuf b = strbuf_local(buf, sizeof buf);
   strbuf_append_exit_status(b, status);
-  _log_iterator_printf_nl(&it, LOG_LEVEL_DEBUG, __NOWHERE__, "gdb %s", buf);
+  _log_iterator_printf_nl(&it, level, __NOWHERE__, "gdb %s", buf);
   unlink(tempfile);
 #endif
   return 0;
-}
-
-const char *log_level_as_string(int level)
-{
-  switch (level) {
-    case LOG_LEVEL_SILENT: return "silent";
-    case LOG_LEVEL_DEBUG:  return "debug";
-    case LOG_LEVEL_INFO:   return "info";
-    case LOG_LEVEL_HINT:   return "hint";
-    case LOG_LEVEL_WARN:   return "warn";
-    case LOG_LEVEL_ERROR:  return "error";
-    case LOG_LEVEL_FATAL:  return "fatal";
-    case LOG_LEVEL_NONE:   return "none";
-  }
-  return NULL;
-}
-
-int string_to_log_level(const char *text)
-{
-  if (strcasecmp(text, "none") == 0)   return LOG_LEVEL_NONE;
-  if (strcasecmp(text, "fatal") == 0)  return LOG_LEVEL_FATAL;
-  if (strcasecmp(text, "error") == 0)  return LOG_LEVEL_ERROR;
-  if (strcasecmp(text, "warn") == 0)   return LOG_LEVEL_WARN;
-  if (strcasecmp(text, "hint") == 0)   return LOG_LEVEL_HINT;
-  if (strcasecmp(text, "info") == 0)   return LOG_LEVEL_INFO;
-  if (strcasecmp(text, "debug") == 0)  return LOG_LEVEL_DEBUG;
-  if (strcasecmp(text, "silent") == 0) return LOG_LEVEL_SILENT;
-  return LOG_LEVEL_INVALID;
 }

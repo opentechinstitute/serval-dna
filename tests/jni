@@ -24,7 +24,9 @@ source "${0%/*}/../testconfig.sh"
 
 setup() {
    setup_servald
-   executeOk_servald config set debug.verbose 1
+   executeOk_servald config \
+	set debug.verbose 1 \
+	set log.console.level debug
    assert_echo_works
    compile_java_classes
    setup_servald_so
@@ -33,10 +35,10 @@ setup() {
 compile_java_classes() {
    assert --message='Java compiler was detected by ./configure' [ "$JAVAC" ]
    mkdir classes
-   assert $JAVAC -Xlint:unchecked -d classes "$servald_source_root"/java/org/servalproject/servald/*.java
-   assert [ -r classes/org/servalproject/servald/ServalD.class ]
-   assert [ -r classes/org/servalproject/servald/IJniResults.class ]
-   assert [ -r classes/org/servalproject/servald/ServalDTests.class ]
+   assert find "$servald_source_root"/java/ -name *.java | xargs $JAVAC -Xlint:unchecked -d classes 
+   assert [ -r classes/org/servalproject/servaldna/ServalDCommand.class ]
+   assert [ -r classes/org/servalproject/servaldna/IJniResults.class ]
+   assert [ -r classes/org/servalproject/test/ServalDTests.class ]
 }
 
 # Make sure that the normal echo command-line works, without JNI.
@@ -47,8 +49,8 @@ assert_echo_works() {
 
 doc_Echo="Serval JNI echo Hello world"
 test_Echo() {
-   executeOk java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.servald.ServalD 'echo' '-e' 'Hello,\ttab' 'world\0!'
-   assertStdoutIs -e 'Hello,\ttab\nworld\0!\n'
+   executeOk java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.test.ServalDTests 'echo' '-e' 'Hello,\ttab' 'world\0!'
+   assertStdoutIs -e 'Hello,\ttab world\0! \n'
 }
 
 doc_Delim="Serval non-JNI output delimiter environment variable"
@@ -64,18 +66,73 @@ test_Delim() {
 
 doc_Repeat="Serval JNI repeated calls in same process"
 test_Repeat() {
-   executeOk --core-backtrace java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.servald.ServalDTests repeat 50 'echo' 'Hello,' 'world!'
+   executeOk --core-backtrace java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.test.ServalDTests repeat 50 'echo' 'Hello,' 'world!'
    assertStdoutLineCount '==' 50
-   assertStdoutGrep --matches=50 '^0:Hello,:world!$'
+   assertStdoutGrep --matches=50 '^Hello, world! $'
 }
 
 doc_NullArg="Serval JNI null arguments throw exception"
 test_NullArg() {
-   execute --core-backtrace java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.servald.ServalDTests nullArg 'echo' '(null)'
+   execute --core-backtrace java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.test.ServalDTests 'echo' '(null)'
    tfw_cat --stdout --stderr
    assertExitStatus '!=' 0
    assertStderrGrep 'NullPointerException: null element in argv'
 }
 
+doc_help="Serval JNI returns help text"
+test_help() {
+   execute --core-backtrace java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.test.ServalDTests 'help'
+   tfw_cat --stdout --stderr
+   assertExitStatus '==' 0
+   assertStdoutGrep 'Serval DNA version '
+}
+
+doc_PeerList="Get peer details via JNI"
+setup_PeerList() {
+   configure_servald_server() {
+      add_servald_interface
+   }
+   setup
+   foreach_instance +A +B create_single_identity
+   start_servald_instances +A +B
+   set_instance +A
+}
+test_PeerList() {
+   execute --core-backtrace java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.test.CommandLine 'peers'
+   assertStdoutGrep "$SIDB"
+   tfw_cat --stdout
+}
+teardown_PeerList() {
+   stop_all_servald_servers
+   kill_all_servald_processes
+   assert_no_servald_processes
+   report_all_servald_servers
+}
+
+doc_DnaLookup="DNA Lookup via JNI MDP API"
+setup_DnaLookup() {
+   configure_servald_server() {
+      add_servald_interface
+      executeOk_servald config \
+         set debug.mdprequests on \
+         set mdp.enable_inet on
+   }
+   setup
+   set_instance +A
+   foreach_instance +A +B create_single_identity
+   start_servald_instances +A +B
+   set_instance +A
+}
+test_DnaLookup() {
+   execute --timeout=10 --core-backtrace java "-Djava.library.path=$LD_LIBRARY_PATH" -classpath "$PWD/classes" org.servalproject.test.CommandLine 'lookup'
+   assertStdoutGrep "$SIDB"
+   tfw_cat --stdout --stderr
+}
+teardown_DnaLookup() {
+   stop_all_servald_servers
+   kill_all_servald_processes
+   assert_no_servald_processes
+   report_all_servald_servers
+}
 
 runTests "$@"

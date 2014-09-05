@@ -24,7 +24,7 @@ rexp_bundlesecret="$rexp_bundlekey"
 rexp_filehash='[0-9a-fA-F]\{128\}'
 rexp_filesize='[0-9]\{1,\}'
 rexp_version='[0-9]\{1,\}'
-rexp_crypt='[0-9]\{1,\}'
+rexp_crypt='[01]'
 rexp_date='[0-9]\{1,\}'
 rexp_rowid='[0-9]\{1,\}'
 
@@ -52,22 +52,25 @@ assert_manifest_complete() {
 assert_rhizome_list() {
    assertStdoutIs --stderr --line=1 -e '13\n'
    assertStdoutIs --stderr --line=2 -e '_id:service:id:version:date:.inserttime:.author:.fromhere:filesize:filehash:sender:recipient:name\n'
-   local filename
    local exactly=true
    local re__inserttime="$rexp_date"
    local re__fromhere='[01]'
    local re__author="\($rexp_sid\)\{0,1\}"
    local files=0
-   for filename; do
-      case "$filename" in
-      --fromhere=*) re__fromhere="${filename#*=}";;
-      --author=*) re__author="${filename#*=}";;
+   local manifestname=
+   local arg
+   for arg; do
+      case "$arg" in
+      --fromhere=*) re__fromhere="${arg#*=}";;
+      --author=*) re__author="${arg#*=}";;
+      --manifest=*) manifestname="${arg#*=}";;
       --and-others) exactly=false;;
-      --*) error "unsupported option: $filename";;
+      --*) error "unsupported option: $arg";;
       *)
-         unpack_manifest_for_grep "$filename"
+         unpack_manifest_for_grep "$arg" "$manifestname"
          assertStdoutGrep --stderr --matches=1 "^$rexp_rowid:$re_service:$re_manifestid:$re_version:$re_date:$re__inserttime:$re__author:$re__fromhere:$re_filesize:$re_filehash:$re_sender:$re_recipient:$re_name\$"
          let files+=1
+         manifestname=
          ;;
       esac
    done
@@ -110,11 +113,26 @@ rhizome_list_dump() {
 }
 
 assert_stdout_add_file() {
+   local manifestname=
+   while [ $# -gt 0 ]; do
+      case "$1" in
+      --manifest=*) manifestname="${1#*=}"; shift;;
+      --*) error "unsupported option: $1"; return 1;;
+      --) shift; break;;
+      *) break;;
+      esac
+   done
    [ $# -ge 1 ] || error "missing filename arg"
-   local filename="${1}"
+   local filename="$1"
    shift
-   unpack_manifest_for_grep "$filename"
+   unpack_manifest_for_grep "$filename" "$manifestname"
    compute_filehash actual_filehash "$filename" actual_filesize
+   opt_service=
+   opt_manifestid=
+   opt_author=
+   opt_secret=
+   opt_BK=
+   opt_filesize=
    opt_name=false
    if replayStdout | $GREP -q '^service:file$'; then
       opt_name=true
@@ -123,7 +141,7 @@ assert_stdout_add_file() {
    if [ "$re_crypt" = 1 ]; then
       opt_filehash=false
    fi
-   fieldnames='service|manifestid|secret|filesize|filehash|name'
+   fieldnames='service|manifestid|author|secret|BK|filesize|filehash|name'
    for arg; do
       case "$arg" in
       !+($fieldnames))
@@ -142,59 +160,57 @@ assert_stdout_add_file() {
    done
    ${opt_service:-true} && assertStdoutGrep --matches=1 "^service:$re_service\$"
    ${opt_manifestid:-true} && assertStdoutGrep --matches=1 "^manifestid:$re_manifestid\$"
-   ${opt_secret:-true} && assertStdoutGrep --matches=1 "^secret:$re_secret\$"
+   ${opt_author:-true} && assertStdoutGrep --matches=1 "^\.author:$rexp_sid\$"
+   ${opt_secret:-true} && assertStdoutGrep --matches=1 "^\.secret:$re_secret\$"
+   ${opt_BK:-true} && assertStdoutGrep --matches=1 "^BK:$re_BK\$"
    ${opt_filesize:-true} && assertStdoutGrep --matches=1 "^filesize:$actual_filesize\$"
    if replayStdout | $GREP -q '^filesize:0$'; then
       assertStdoutGrep --matches=0 "^filehash:"
    else
       ${opt_filehash:-true} && assertStdoutGrep --matches=1 "^filehash:$actual_filehash\$"
    fi
+   ${opt_name:-true} && assertStdoutGrep --matches=1 "^name:$re_name\$"
 }
 
 assert_stdout_import_bundle() {
-   # Output of "import bundle" is the same as "add file" but without the secret.
-   assert_stdout_add_file "$@" '!secret'
+   # Output of "import bundle" is the same as "add file" but without the secret
+   # or author fields.
+   assert_stdout_add_file "$@" '!secret' '!author'
 }
 
 unpack_manifest_for_grep() {
    local filename="$1"
+   local manifestname="${2:-$filename.manifest}"
    re_service="$rexp_service"
    re_manifestid="$rexp_manifestid"
    re_version="$rexp_version"
    re_date="$rexp_date"
    re_secret="$rexp_bundlesecret"
+   re_BK="$rexp_bundlekey"
    re_sender="\($rexp_sid\)\{0,1\}"
    re_recipient="\($rexp_sid\)\{0,1\}"
    re_filesize="$rexp_filesize"
-   re_filehash="$rexp_filehash"
+   re_filehash="\($rexp_filehash\)\{0,1\}"
    re_name=$(escape_grep_basic "${filename##*/}")
-   if [ -e "$filename.manifest" ]; then
-      re_filesize=$($SED -n -e '/^filesize=/s///p' "$filename.manifest")
+   if [ -e "$manifestname" ]; then
+      re_filesize=$($SED -n -e '/^filesize=/s///p' "$manifestname")
       if [ "$filesize" = 0 ]; then
          re_filehash=
       else
-         re_filehash=$($SED -n -e '/^filehash=/s///p' "$filename.manifest")
+         re_filehash=$($SED -n -e '/^filehash=/s///p' "$manifestname")
       fi
       re_secret="$rexp_bundlesecret"
-      re_service=$($SED -n -e '/^service=/s///p' "$filename.manifest")
+      re_service=$($SED -n -e '/^service=/s///p' "$manifestname")
       re_service=$(escape_grep_basic "$re_service")
-      re_manifestid=$($SED -n -e '/^id=/s///p' "$filename.manifest")
-      re_version=$($SED -n -e '/^version=/s///p' "$filename.manifest")
-      re_date=$($SED -n -e '/^date=/s///p' "$filename.manifest")
-      re_crypt=$($SED -n -e '/^crypt=/s///p' "$filename.manifest")
-      re_name=$($SED -n -e '/^name=/s///p' "$filename.manifest")
+      re_manifestid=$($SED -n -e '/^id=/s///p' "$manifestname")
+      re_version=$($SED -n -e '/^version=/s///p' "$manifestname")
+      re_date=$($SED -n -e '/^date=/s///p' "$manifestname")
+      re_crypt=$($SED -n -e '/^crypt=/s///p' "$manifestname")
+      re_name=$($SED -n -e '/^name=/s///p' "$manifestname")
       re_name=$(escape_grep_basic "$re_name")
-      re_sender=$($SED -n -e '/^sender=/s///p' "$filename.manifest")
-      re_recipient=$($SED -n -e '/^recipient=/s///p' "$filename.manifest")
-      case "$re_service" in
-      file)
-         re_sender=
-         re_recipient=
-         ;;
-      *)
-         re_name=
-         ;;
-      esac
+      re_BK=$($SED -n -e '/^BK=/s///p' "$manifestname")
+      re_sender=$($SED -n -e '/^sender=/s///p' "$manifestname")
+      re_recipient=$($SED -n -e '/^recipient=/s///p' "$manifestname")
    fi
 }
 
@@ -225,12 +241,40 @@ extract_stdout_version() {
    extract_stdout_keyvalue "$1" version "$rexp_version"
 }
 
+extract_stdout_author() {
+   extract_stdout_keyvalue "$1" .author "$rexp_author"
+}
+
 extract_stdout_secret() {
-   extract_stdout_keyvalue "$1" secret "$rexp_bundlesecret"
+   extract_stdout_keyvalue "$1" .secret "$rexp_bundlesecret"
+}
+
+extract_stdout_rowid() {
+   extract_stdout_keyvalue "$1" .rowid "$rexp_rowid"
+}
+
+extract_stdout_inserttime() {
+   extract_stdout_keyvalue "$1" .inserttime "$rexp_date"
 }
 
 extract_stdout_BK() {
    extract_stdout_keyvalue "$1" BK "$rexp_bundlekey"
+}
+
+extract_stdout_date() {
+   extract_stdout_keyvalue "$1" date "$rexp_date"
+}
+
+extract_stdout_filesize() {
+   extract_stdout_keyvalue "$1" filesize "$rexp_filesize"
+}
+
+extract_stdout_filehash() {
+   extract_stdout_keyvalue "$1" filehash "$rexp_filehash"
+}
+
+extract_stdout_crypt() {
+   extract_stdout_keyvalue "$1" crypt "$rexp_crypt"
 }
 
 extract_manifest() {
@@ -273,36 +317,45 @@ extract_manifest_version() {
    extract_manifest "$1" "$2" version "$rexp_version"
 }
 
+extract_manifest_date() {
+   extract_manifest "$1" "$2" date "$rexp_date"
+}
+
 extract_manifest_crypt() {
    extract_manifest "$1" "$2" crypt "$rexp_crypt"
 }
 
 compute_filehash() {
-   local _var="$1"
+   local _filehashvar="$1"
    local _file="$2"
-   local _filesize="$3"
-   local _hash=$($servald rhizome hash file "$_file") || error "$servald failed to compute file hash"
-   [ -z "${_hash//[0-9a-fA-F]/}" ] || error "file hash contains non-hex: $_hash"
-   [ "${#_hash}" -eq 128 ] || error "file hash incorrect length: $_hash"
-   local _size=$(( $(cat "$filename" | wc -c) + 0 ))
-   [ -n "$_var" ] && eval $_var="\$_hash"
-   [ -n "$_filesize" ] && eval $_filesize="\$_size"
+   local _filesizevar="$3"
+   local _hash=
+   local _size=0
+   if [ -s "$_file" ]; then
+      local _hash=$($servald rhizome hash file "$_file") || error "$servald failed to compute file hash"
+      [ -z "${_hash//[0-9a-fA-F]/}" ] || error "file hash contains non-hex: $_hash"
+      [ "${#_hash}" -eq 128 ] || error "file hash incorrect length: $_hash"
+      local _size=$(( $(cat "$filename" | wc -c) + 0 ))
+   fi
+   [ -n "$_filehashvar" ] && eval $_filehashvar="\$_hash"
+   [ -n "$_filesizevar" ] && eval $_filesizevar="\$_size"
 }
 
 rhizome_http_server_started() {
    local logvar=LOG${1#+}
-   $GREP 'RHIZOME HTTP SERVER,.*START.*port=[0-9]' "${!logvar}"
+   $GREP 'HTTP SERVER START.*port=[0-9].*services=[^ ]*\<Rhizome\>' "${!logvar}"
 }
 
 get_rhizome_server_port() {
+   push_and_set_instance $2 || return $?
    local _var="$1"
-   local _logvar=LOG${2#+}
-   local _port=$($SED -n -e '/RHIZOME HTTP SERVER.*START/s/.*port=\([0-9]\{1,\}\).*/\1/p' "${!_logvar}" | $SED -n '$p')
-   assert --message="instance $2 Rhizome HTTP server port number is known" [ -n "$_port" ]
+   local _port=$(<"$SERVALINSTANCE_PATH/proc/http_port")
+   assert --message="instance $instance_name Rhizome HTTP server port number is known" [ -n "$_port" ]
    if [ -n "$_var" ]; then
       eval "$_var=\$_port"
       tfw_log "$_var=$_port"
    fi
+   pop_instance
    return 0
 }
 
@@ -322,7 +375,7 @@ bundle_received_by() {
          $restart && rexps=() bundles=()
          restart=false
          bid="${arg%%:*}"
-         matches_rexp "$rexp_manifestid" "$bid" || error "invalid bundle ID: $bid"
+         matches_rexp "$rexp_manifestid" "$bid" || error "invalid bundle ID: $bid" || return $?
          bundles+=("$arg")
          if [ "$bid" = "$arg" ]; then
             rexps+=("RHIZOME ADD MANIFEST service=.* bid=$bid")
@@ -332,8 +385,7 @@ bundle_received_by() {
          fi
          ;;
       +[A-Z])
-         push_instance
-         tfw_nolog set_instance $arg || return $?
+         tfw_nolog push_and_set_instance $arg || return $?
          tfw_nolog assert_servald_server_status running
          for ((i = 0; i < ${#bundles[*]}; ++i)); do
             bundle="${bundles[$i]}"
@@ -436,4 +488,3 @@ assert_rhizome_received() {
       fi
    done
 }
-

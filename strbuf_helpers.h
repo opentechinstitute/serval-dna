@@ -20,6 +20,15 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #ifndef __STRBUF_HELPERS_H__
 #define __STRBUF_HELPERS_H__
 
+// For socklen_t
+#ifdef WIN32
+#  include "win32/win32.h"
+#else
+#  ifdef HAVE_SYS_SOCKET_H
+#    include <sys/socket.h>
+#  endif
+#endif
+
 #include "strbuf.h"
 
 /* Append a representation of the given chars in a given buffer (including nul
@@ -58,6 +67,7 @@ strbuf strbuf_path_join(strbuf sb, ...);
  * @author Andrew Bettison <andrew@servalproject.com>
  */
 strbuf strbuf_append_poll_events(strbuf sb, short events);
+#define alloca_poll_events(ev)    strbuf_str(strbuf_append_poll_events(strbuf_alloca(200), (ev)))
 
 /* Append a nul-terminated string as a single-quoted shell word which, if
  * expanded in a shell command line, would evaluate to the original string.
@@ -95,17 +105,110 @@ strbuf strbuf_append_argv(strbuf sb, int argc, const char *const *argv);
  */
 strbuf strbuf_append_exit_status(strbuf sb, int status);
 
+/* Append a textual description of a socket domain code (AF_...).
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+strbuf strbuf_append_socket_domain(strbuf sb, int domain);
+#define alloca_socket_domain(domain)    strbuf_str(strbuf_append_socket_domain(strbuf_alloca(15), domain))
+
+/* Append a textual description of a socket type code (SOCK_...).
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+strbuf strbuf_append_socket_type(strbuf sb, int type);
+#define alloca_socket_type(type)    strbuf_str(strbuf_append_socket_type(strbuf_alloca(15), type))
+
+/* Append a textual description of a struct in_addr (in network order) as IPv4
+ * quartet "N.N.N.N".
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+struct in_addr;
+strbuf strbuf_append_in_addr(strbuf sb, const struct in_addr *addr);
+#define alloca_in_addr(addr)    strbuf_str(strbuf_append_in_addr(strbuf_alloca(16), (const struct in_addr *)(addr)))
+
 /* Append a textual description of a struct sockaddr_in.
  * @author Andrew Bettison <andrew@servalproject.com>
  */
+struct sockaddr_in;
+strbuf strbuf_append_sockaddr_in(strbuf sb, const struct sockaddr_in *addr);
+#define alloca_sockaddr_in(addr)    strbuf_str(strbuf_append_sockaddr_in(strbuf_alloca(45), (const struct sockaddr_in *)(addr)))
+
+/* Append a textual description of a struct sockaddr.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
 struct sockaddr;
-strbuf strbuf_append_sockaddr(strbuf sb, const struct sockaddr *);
-#define alloca_sockaddr(addr)    strbuf_str(strbuf_append_sockaddr(strbuf_alloca(40), (const struct sockaddr *)(addr)))
+strbuf strbuf_append_sockaddr(strbuf sb, const struct sockaddr *addr, socklen_t addrlen);
+#define alloca_sockaddr(addr, addrlen)    strbuf_str(strbuf_append_sockaddr(strbuf_alloca(200), (const struct sockaddr *)(addr), (addrlen)))
+
+struct socket_address;
+strbuf strbuf_append_socket_address(strbuf sb, const struct socket_address *addr);
+#define alloca_socket_address(addr)    strbuf_str(strbuf_append_socket_address(strbuf_alloca(200), (addr)))
 
 /* Append a strftime(3) string.
  * @author Andrew Bettison <andrew@servalproject.com>
  */
 struct tm;
 strbuf strbuf_append_strftime(strbuf sb, const char *format, const struct tm *tm);
+
+/* Append a representation of a struct iovec[] array.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+struct iovec;
+strbuf strbuf_append_iovec(strbuf sb, const struct iovec *iov, int iovcnt);
+#define alloca_iovec(iov,cnt)    strbuf_str(strbuf_append_iovec(strbuf_alloca(200), (iov), (cnt)))
+
+/* Append a string using HTTP quoted-string format: delimited by double quotes (") and
+ * internal double quotes and backslash escaped by leading backslash.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+strbuf strbuf_append_quoted_string(strbuf sb, const char *str);
+
+/* Escape HTML entities.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+strbuf strbuf_html_escape(strbuf sb, const char *, size_t);
+
+/* Append various JSON elements.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+strbuf strbuf_json_null(strbuf sb);
+strbuf strbuf_json_boolean(strbuf sb, int boolean);
+strbuf strbuf_json_string(strbuf sb, const char *str); // str can be NULL
+strbuf strbuf_json_string_len(strbuf sb, const char *str, size_t strlen); // str cannot be NULL
+strbuf strbuf_json_hex(strbuf sb, const unsigned char *buf, size_t len);
+struct json_atom {
+    enum json_atomic_type { JSON_NULL, JSON_BOOLEAN, JSON_INTEGER, JSON_STRING_NULTERM, JSON_STRING_LENGTH } type;
+    union {
+        int boolean;
+        int64_t integer;
+        struct {
+            const char *content;
+            size_t length;
+        } string;
+    } u;
+};
+strbuf strbuf_json_atom(strbuf sb, const struct json_atom *);
+strbuf strbuf_json_atom_as_html(strbuf sb, const struct json_atom *);
+strbuf strbuf_json_atom_as_text(strbuf sb, const struct json_atom *);
+
+/* Append a representation of a struct http_range[] array.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+struct http_range;
+strbuf strbuf_append_http_ranges(strbuf sb, const struct http_range *ranges, unsigned nels);
+#define alloca_http_ranges(ra)    strbuf_str(strbuf_append_http_ranges(strbuf_alloca(25*NELS(ra)), (ra), NELS(ra)))
+
+/* Append a representation of a struct mime_content_type in HTTP header format.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+struct mime_content_type;
+strbuf strbuf_append_mime_content_type(strbuf, const struct mime_content_type *);
+#define alloca_mime_content_type(ct) strbuf_str(strbuf_append_mime_content_type(strbuf_alloca(500), (ct)))
+
+/* Append a representation of a struct mime_content_disposition, in HTTP header format.
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+struct mime_content_disposition;
+strbuf strbuf_append_mime_content_disposition(strbuf, const struct mime_content_disposition *);
+#define alloca_mime_content_disposition(cd) strbuf_str(strbuf_append_mime_content_disposition(strbuf_alloca(500), (cd)))
 
 #endif //__STRBUF_HELPERS_H__

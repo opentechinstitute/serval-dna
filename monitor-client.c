@@ -1,5 +1,6 @@
 /*
-Copyright (C) 2012 Paul Gardner-Stephen, Serval Project.
+Copyright (C) 2012 Paul Gardner-Stephen
+Copyright (C) 2012 Serval Project Inc.
  
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -36,14 +37,15 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #endif
 #include <sys/un.h>
 #include <fcntl.h>
+#include <ctype.h>
 
 #include "constants.h"
 #include "conf.h"
 #include "log.h"
 #include "str.h"
-
+#include "strbuf_helpers.h"
+#include "socket.h"
 #include "monitor-client.h"
-#include <ctype.h>
 
 #define STATE_INIT 0
 #define STATE_DATA 1
@@ -57,62 +59,29 @@ struct monitor_state {
   int argc;
   char *argv[MAX_ARGS];
   unsigned char *data;
-  int dataBytes;
-  int cmdBytes;
+  size_t dataBytes;
+  size_t cmdBytes;
   
   int state;
   unsigned char buffer[MONITOR_CLIENT_BUFFER_SIZE];
-  int bufferBytes;
+  size_t bufferBytes;
 };
-
-int monitor_socket_name(struct sockaddr_un *name){
-  int len;
-#ifdef linux
-  /* Use abstract namespace as Android has no writable FS which supports sockets.
-   Abstract namespace is just plain better, anyway, as no dead files end up
-   hanging around. */
-  name->sun_path[0] = '\0';
-  /* XXX: 104 comes from OSX sys/un.h - no #define (note Linux has UNIX_PATH_MAX and it's 108(!)) */
-  snprintf(&name->sun_path[1],104-2,"%s", config.monitor.socket);
-  /* Doesn't include trailing nul */
-  len = 1+strlen(&name->sun_path[1]) + sizeof(name->sun_family);
-#else
-  snprintf(name->sun_path,104-1,"%s/%s",
-	   serval_instancepath(),
-	   config.monitor.socket
-	  );
-  /* Includes trailing nul */
-  len = 1+strlen(name->sun_path) + sizeof(name->sun_family);
-#endif
-  return len;
-}
 
 /* Open monitor interface abstract domain named socket */
 int monitor_client_open(struct monitor_state **res)
 {
   int fd;
-  struct sockaddr_un addr;
-
-  if ( (fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
-    WHYF_perror("socket(AF_UNIX, SOCK_STREAM, 0)");
+  if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+    return WHYF_perror("socket(AF_UNIX, SOCK_STREAM, 0)");
+  struct socket_address addr;
+  if (make_local_sockaddr(&addr, "monitor.socket") == -1)
     return -1;
-  }
-
-  memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  int len = monitor_socket_name(&addr);
-
-  INFOF("Attempting to connect to %s %s",
-      addr.sun_path[0] ? "local" : "abstract",
-      alloca_str_toprint(addr.sun_path[0] ? &addr.sun_path[0] : &addr.sun_path[1])
-    );
-
-  if (connect(fd, (struct sockaddr*)&addr, len) == -1) {
-    WHYF_perror("connect(%d, %s)", fd, alloca_toprint(-1, &addr, len));
+  if (config.debug.monitor)
+    DEBUGF("Attempting to connect to %s", alloca_socket_address(&addr));
+  if (socket_connect(fd, &addr) == -1) {
     close(fd);
     return -1;
   }
-
   *res = (struct monitor_state*)malloc(sizeof(struct monitor_state));
   memset(*res,0,sizeof(struct monitor_state));
   return fd;
@@ -121,6 +90,8 @@ int monitor_client_open(struct monitor_state **res)
 int monitor_client_close(int fd, struct monitor_state *res){
   free(res);
   close(fd);
+  if (config.debug.monitor)
+    DEBUGF("Closed fd %d", fd);
   return 0;
 }
 
@@ -137,6 +108,9 @@ int monitor_client_writeline(int fd,char *fmt, ...)
   n=vsnprintf(msg, sizeof(msg), fmt, ap);
   va_end(ap);
   
+  if (config.debug.monitor)
+    dump("Writing to monitor", msg, n);
+    
   return write(fd,msg,n);
 }
 
@@ -158,13 +132,15 @@ int monitor_client_writeline_and_data(int fd,unsigned char *data,int bytes,char 
   
   bcopy(data,out+n,bytes);
   n+=bytes;
+  if (config.debug.monitor)
+    dump("Writing to monitor", out, n);
   return write(fd,out,n);
 }
 
 int monitor_client_read(int fd, struct monitor_state *res, struct monitor_command_handler *handlers, int handler_count)
 {
   /* Read any available bytes */
-  int oldOffset = res->bufferBytes;
+  size_t oldOffset = res->bufferBytes;
   
   if (oldOffset+1>=MONITOR_CLIENT_BUFFER_SIZE)
     return WHY("Buffer full without finding command");
@@ -172,7 +148,7 @@ int monitor_client_read(int fd, struct monitor_state *res, struct monitor_comman
   if (res->bufferBytes==0)
     res->cmd = (char *)res->buffer;
   
-  int bytesRead = read(fd, res->buffer + oldOffset, MONITOR_CLIENT_BUFFER_SIZE - oldOffset);
+  ssize_t bytesRead = read(fd, res->buffer + oldOffset, MONITOR_CLIENT_BUFFER_SIZE - oldOffset);
   if (bytesRead == -1){
     switch(errno) {
       case ENOTRECOVERABLE:
@@ -185,18 +161,22 @@ int monitor_client_read(int fd, struct monitor_state *res, struct monitor_comman
 #endif
 	return 0;
     }
-    WHYF_perror("read(%d, %p, %ld)", fd, res->buffer + oldOffset, MONITOR_CLIENT_BUFFER_SIZE - oldOffset);
+    WHYF_perror("read(%d, %p, %zd)", fd, res->buffer + oldOffset, MONITOR_CLIENT_BUFFER_SIZE - oldOffset);
     return -1;
   } else if (bytesRead == 0) {
-    WHYF("read(%d, %p, %ld) returned %d", fd, res->buffer + oldOffset, MONITOR_CLIENT_BUFFER_SIZE - oldOffset, bytesRead);
+    WHYF("read(%d, %p, %zd) returned %zd", fd, res->buffer + oldOffset, MONITOR_CLIENT_BUFFER_SIZE - oldOffset, (size_t)bytesRead);
     return -1;
   }
+  
+  if (config.debug.monitor)
+    dump("Read from monitor", res->buffer + oldOffset, bytesRead);
+    
   res->bufferBytes+=bytesRead;
 
 again:
   // wait until we have the whole command line
   if (res->state == STATE_INIT){
-    int i;
+    size_t i;
     for(i=oldOffset;i<res->bufferBytes;i++){
       if (res->buffer[i]=='\n'){
 	// skip any leading \n's
@@ -212,8 +192,8 @@ again:
 	  res->cmd++;
 	  for (; isdigit(*res->cmd); ++res->cmd)
 	    res->dataBytes = res->dataBytes * 10 + *res->cmd - '0';
-	  if (res->dataBytes<0 || res->dataBytes > MONITOR_CLIENT_BUFFER_SIZE)
-	    return WHYF("Invalid data length %d", res->dataBytes);
+	  if (res->dataBytes > MONITOR_CLIENT_BUFFER_SIZE)
+	    return WHYF("Invalid data length %zd", res->dataBytes);
 	  if (*res->cmd==':')
 	    res->cmd++;
 	}
@@ -257,7 +237,7 @@ again:
     int i;
     // call all handlers that match (yes there might be more than one)
     for (i=0;i<handler_count;i++){
-      /* since we know res->cmd is terminated with a '\n', 
+      /* since we know res->cmd is terminated with a '\0', 
        and there shouldn't be a '\n' in h->command, 
        this shouldn't run past the end of the buffer */
       if (handlers[i].handler && (!handlers[i].command || strcase_startswith(res->cmd,handlers[i].command, NULL))){

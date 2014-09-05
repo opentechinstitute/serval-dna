@@ -20,14 +20,16 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/uio.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <time.h>
 
 #include "serval.h"
 #include "conf.h"
 #include "net.h"
+#include "socket.h"
 #include "str.h"
+#include "strbuf_helpers.h"
 
 struct in_addr hton_in_addr(in_addr_t addr)
 {
@@ -77,11 +79,25 @@ ssize_t _write_all(int fd, const void *buf, size_t len, struct __sourceloc __whe
 {
   ssize_t written = write(fd, buf, len);
   if (written == -1)
-    return WHYF_perror("write_all: write(%d,%p %s,%lu)",
-	fd, buf, alloca_toprint(30, buf, len), (unsigned long)len);
-  if (written != len)
-    return WHYF_perror("write_all: write(%d,%p %s,%lu) returned %ld",
-	fd, buf, alloca_toprint(30, buf, len), (unsigned long)len, (long)written);
+    return WHYF_perror("write_all: write(%d,%p %s,%zu)",
+	fd, buf, alloca_toprint(30, buf, len), len);
+  if ((size_t)written != len)
+    return WHYF_perror("write_all: write(%d,%p %s,%zu) returned %zd",
+	fd, buf, alloca_toprint(30, buf, len), len, (size_t)written);
+  return written;
+}
+
+ssize_t _writev_all(int fd, const struct iovec *iov, int iovcnt, struct __sourceloc __whence)
+{
+  size_t len = 0;
+  int i;
+  for (i = 0; i < iovcnt; ++i)
+    len += iov[i].iov_len;
+  ssize_t written = writev(fd, iov, iovcnt);
+  if (written == -1)
+    return WHYF_perror("writev_all: writev(%d,%s len=%zu)", fd, alloca_iovec(iov, iovcnt), len);
+  if ((size_t)written != len)
+    return WHYF_perror("writev_all: writev(%d,%s len=%zu) returned %zd", fd, alloca_iovec(iov, iovcnt), len, (size_t)written);
   return written;
 }
 
@@ -107,9 +123,9 @@ ssize_t _write_nonblock(int fd, const void *buf, size_t len, struct __sourceloc 
 ssize_t _write_all_nonblock(int fd, const void *buf, size_t len, struct __sourceloc __whence)
 {
   ssize_t written = _write_nonblock(fd, buf, len, __whence);
-  if (written != -1 && written != len)
-    return WHYF("write_all_nonblock: write(%d,%p %s,%lu) returned %ld",
-	fd, buf, alloca_toprint(30, buf, len), (unsigned long)len, (long)written);
+  if (written != -1 && (size_t)written != len)
+    return WHYF("write_all_nonblock: write(%d,%p %s,%zu) returned %zd",
+	fd, buf, alloca_toprint(30, buf, len), len, (size_t)written);
   return written;
 }
 
@@ -121,64 +137,4 @@ ssize_t _write_str(int fd, const char *str, struct __sourceloc __whence)
 ssize_t _write_str_nonblock(int fd, const char *str, struct __sourceloc __whence)
 {
   return _write_all_nonblock(fd, str, strlen(str), __whence);
-}
-
-ssize_t recvwithttl(int sock,unsigned char *buffer, size_t bufferlen,int *ttl,
-		    struct sockaddr *recvaddr, socklen_t *recvaddrlen)
-{
-  struct msghdr msg;
-  struct iovec iov[1];
-  
-  iov[0].iov_base=buffer;
-  iov[0].iov_len=bufferlen;
-  bzero(&msg,sizeof(msg));
-  msg.msg_name = recvaddr;
-  msg.msg_namelen = *recvaddrlen;
-  msg.msg_iov = &iov[0];
-  msg.msg_iovlen = 1;
-  // setting the following makes the data end up in the wrong place
-  //  msg.msg_iov->iov_base=iov_buffer;
-  // msg.msg_iov->iov_len=sizeof(iov_buffer);
-  
-  struct cmsghdr cmsgcmsg[16];
-  msg.msg_control = &cmsgcmsg[0];
-  msg.msg_controllen = sizeof(struct cmsghdr)*16;
-  msg.msg_flags = 0;
-  
-  ssize_t len = recvmsg(sock,&msg,0);
-  if (len == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
-    return WHY_perror("recvmsg");
-  
-  if (0 && config.debug.packetrx) {
-    DEBUGF("recvmsg returned %lld (flags=%d, msg_controllen=%d)", (long long) len, msg.msg_flags, msg.msg_controllen);
-    dump("received data", buffer, len);
-  }
-  
-  struct cmsghdr *cmsg;
-  if (len>0)
-  {
-    for (cmsg = CMSG_FIRSTHDR(&msg); 
-	 cmsg != NULL; 
-	 cmsg = CMSG_NXTHDR(&msg,cmsg)) {
-      
-      if ((cmsg->cmsg_level == IPPROTO_IP) && 
-	  ((cmsg->cmsg_type == IP_RECVTTL) ||(cmsg->cmsg_type == IP_TTL))
-	  &&(cmsg->cmsg_len) ){
-	if (config.debug.packetrx)
-	  DEBUGF("  TTL (%p) data location resolves to %p", ttl,CMSG_DATA(cmsg));
-	if (CMSG_DATA(cmsg)) {
-	  *ttl = *(unsigned char *) CMSG_DATA(cmsg);
-	  if (config.debug.packetrx)
-	    DEBUGF("  TTL of packet is %d", *ttl);
-	} 
-      } else {
-	if (config.debug.packetrx)
-	  DEBUGF("I didn't expect to see level=%02x, type=%02x",
-		 cmsg->cmsg_level,cmsg->cmsg_type);
-      }	 
-    }
-  }
-  *recvaddrlen=msg.msg_namelen;
-  
-  return len;
 }

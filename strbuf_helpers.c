@@ -17,20 +17,56 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
-#include "strbuf_helpers.h"
-#include <poll.h>
+/*
+  Portions Copyright (C) 2013 Petter Reinholdtsen
+  Some rights reserved
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in
+     the documentation and/or other materials provided with the
+     distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+*/
+
 #include <ctype.h>
 #include <string.h>
 #include <time.h>
 #include <assert.h>
 #include <stdarg.h>
+#include <inttypes.h>
 #include <sys/wait.h>
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#endif
 #ifdef HAVE_NETINET_IN_H
 #include <netinet/in.h>
 #endif
 #ifdef HAVE_ARPA_INET_H
 #include <arpa/inet.h>
 #endif
+#include <sys/uio.h>
+#include "http_server.h"
+#include "strbuf_helpers.h"
+#include "str.h"
+#include "socket.h"
 
 static inline strbuf _toprint(strbuf sb, char c)
 {
@@ -51,7 +87,7 @@ static inline strbuf _toprint(strbuf sb, char c)
   return sb;
 }
 
-static strbuf inline _overrun(strbuf sb, const char *suffix)
+inline static strbuf _overrun(strbuf sb, const char *suffix)
 {
   if (strbuf_overrun(sb)) {
     strbuf_trunc(sb, -strlen(suffix));
@@ -60,7 +96,7 @@ static strbuf inline _overrun(strbuf sb, const char *suffix)
   return sb;
 }
 
-static strbuf inline _overrun_quote(strbuf sb, char quote, const char *suffix)
+inline static strbuf _overrun_quote(strbuf sb, char quote, const char *suffix)
 {
   if (strbuf_overrun(sb)) {
     strbuf_trunc(sb, -strlen(suffix) - (quote ? 1 : 0));
@@ -238,10 +274,10 @@ strbuf strbuf_append_exit_status(strbuf sb, int status)
   return sb;
 }
 
-strbuf strbuf_append_sockaddr(strbuf sb, const struct sockaddr *addr)
+strbuf strbuf_append_socket_domain(strbuf sb, int domain)
 {
   const char *fam = NULL;
-  switch (addr->sa_family) {
+  switch (domain) {
   case AF_UNSPEC:    fam = "AF_UNSPEC"; break;
   case AF_UNIX:	     fam = "AF_UNIX"; break;
   case AF_INET:	     fam = "AF_INET"; break;
@@ -278,36 +314,99 @@ strbuf strbuf_append_sockaddr(strbuf sb, const struct sockaddr *addr)
   if (fam)
     strbuf_puts(sb, fam);
   else
-    strbuf_sprintf(sb, "[%d]", addr->sa_family);
+    strbuf_sprintf(sb, "[%d]", domain);
+  return sb;
+}
+
+strbuf strbuf_append_socket_type(strbuf sb, int type)
+{
+  const char *typ = NULL;
+  switch (type) {
+  case SOCK_STREAM:	typ = "SOCK_STREAM"; break;
+  case SOCK_DGRAM:	typ = "SOCK_DGRAM"; break;
+#ifdef SOCK_RAW
+  case SOCK_RAW:	typ = "SOCK_RAW"; break;
+#endif
+#ifdef SOCK_RDM
+  case SOCK_RDM:	typ = "SOCK_RDM"; break;
+#endif
+#ifdef SOCK_SEQPACKET
+  case SOCK_SEQPACKET:	typ = "SOCK_SEQPACKET"; break;
+#endif
+#ifdef SOCK_PACKET
+  case SOCK_PACKET:	typ = "SOCK_PACKET"; break;
+#endif
+  }
+  if (typ)
+    strbuf_puts(sb, typ);
+  else
+    strbuf_sprintf(sb, "[%d]", type);
+  return sb;
+}
+
+strbuf strbuf_append_in_addr(strbuf sb, const struct in_addr *addr)
+{
+  strbuf_sprintf(sb, "%u.%u.%u.%u",
+      ((unsigned char *) &addr->s_addr)[0],
+      ((unsigned char *) &addr->s_addr)[1],
+      ((unsigned char *) &addr->s_addr)[2],
+      ((unsigned char *) &addr->s_addr)[3]);
+  return sb;
+}
+
+strbuf strbuf_append_sockaddr_in(strbuf sb, const struct sockaddr_in *addr)
+{
+  assert(addr->sin_family == AF_INET);
+  strbuf_puts(sb, "AF_INET:");
+  strbuf_append_in_addr(sb, &addr->sin_addr);
+  strbuf_sprintf(sb, ":%u", ntohs(addr->sin_port));
+  return sb;
+}
+
+strbuf strbuf_append_sockaddr(strbuf sb, const struct sockaddr *addr, socklen_t addrlen)
+{
   switch (addr->sa_family) {
-  case AF_UNIX:
-    strbuf_putc(sb, ' ');
-    if (addr->sa_data[0])
-      strbuf_toprint_quoted_len(sb, addr->sa_data, "\"\"", sizeof addr->sa_data);
-    else {
-      strbuf_puts(sb, "abstract ");
-      strbuf_toprint_quoted_len(sb, addr->sa_data, "\"\"", sizeof addr->sa_data);
+  case AF_UNIX: {
+      strbuf_puts(sb, "AF_UNIX:");
+      size_t len = addrlen > sizeof addr->sa_family ? addrlen - sizeof addr->sa_family : 0;
+      if (addr->sa_data[0]) {
+	strbuf_toprint_quoted_len(sb, "\"\"", addr->sa_data, len);
+	if (len < 2)
+	  strbuf_sprintf(sb, " (addrlen=%d too short)", (int)addrlen);
+	if (len == 0 || addr->sa_data[len - 1] != '\0')
+	  strbuf_sprintf(sb, " (addrlen=%d, no nul terminator)", (int)addrlen);
+      } else {
+	strbuf_puts(sb, "abstract ");
+	strbuf_toprint_quoted_len(sb, "\"\"", addr->sa_data, len);
+	if (len == 0)
+	  strbuf_sprintf(sb, " (addrlen=%d too short)", (int)addrlen);
+      }
     }
     break;
   case AF_INET: {
       const struct sockaddr_in *addr_in = (const struct sockaddr_in *) addr;
-      strbuf_sprintf(sb, " %u.%u.%u.%u:%u",
-	  ((unsigned char *) &addr_in->sin_addr.s_addr)[0],
-	  ((unsigned char *) &addr_in->sin_addr.s_addr)[1],
-	  ((unsigned char *) &addr_in->sin_addr.s_addr)[2],
-	  ((unsigned char *) &addr_in->sin_addr.s_addr)[3],
-	  ntohs(addr_in->sin_port)
-	);
+      strbuf_append_sockaddr_in(sb, addr_in);
+      if (addrlen != sizeof(struct sockaddr_in))
+	strbuf_sprintf(sb, " (addrlen=%d should be %zd)", (int)addrlen, sizeof(struct sockaddr_in));
     }
     break;
   default: {
-      int i;
-      for (i = 0; i < sizeof addr->sa_data; ++i)
-	strbuf_sprintf(sb, " %02x", addr->sa_data[i]);
+      strbuf_append_socket_domain(sb, addr->sa_family);
+      size_t len = addrlen > sizeof addr->sa_family ? addrlen - sizeof addr->sa_family : 0;
+      unsigned i;
+      for (i = 0; i < len; ++i) {
+	strbuf_putc(sb, i ? ',' : ':');
+	strbuf_sprintf(sb, "%02x", addr->sa_data[i]);
+      }
     }
     break;
   }
   return sb;
+}
+
+strbuf strbuf_append_socket_address(strbuf sb, const struct socket_address *addr)
+{
+  return strbuf_append_sockaddr(sb, &addr->addr, addr->addrlen);
 }
 
 strbuf strbuf_append_strftime(strbuf sb, const char *format, const struct tm *tm)
@@ -332,5 +431,249 @@ strbuf strbuf_append_strftime(strbuf sb, const char *format, const struct tm *tm
   char *buf = alloca(len + 1);
   size_t n = strftime(buf, len + 1, format, tm);
   strbuf_ncat(sb, buf, n);
+  return sb;
+}
+
+strbuf strbuf_append_iovec(strbuf sb, const struct iovec *iov, int iovcnt)
+{
+  int i;
+  strbuf_putc(sb, '[');
+  for (i = 0; i < iovcnt; ++i) {
+    if (i)
+      strbuf_puts(sb, ", ");
+    strbuf_sprintf(sb, "%p#%zu", iov[i].iov_base, iov[i].iov_len);
+  }
+  strbuf_putc(sb, ']');
+  return sb;
+}
+
+strbuf strbuf_append_quoted_string(strbuf sb, const char *str)
+{
+  strbuf_putc(sb, '"');
+  for (; *str; ++str) {
+    if (*str == '"' || *str == '\\')
+      strbuf_putc(sb, '\\');
+    strbuf_putc(sb, *str);
+  }
+  strbuf_putc(sb, '"');
+  return sb;
+}
+
+static void _html_char(strbuf sb, char c)
+{
+  if (c == '&')
+    strbuf_puts(sb, "&amp;");
+  else if (c == '<')
+    strbuf_puts(sb, "&lt;");
+  else if (c == '>')
+    strbuf_puts(sb, "&gt;");
+  else if (c == '"')
+    strbuf_puts(sb, "&quot;");
+  else if (c == '\'')
+    strbuf_puts(sb, "&apos;");
+  else if (iscntrl(c))
+    strbuf_sprintf(sb, "&#%u;", (unsigned char) c);
+  else
+    strbuf_putc(sb, c);
+}
+
+strbuf strbuf_html_escape(strbuf sb, const char *str, size_t strlen)
+{
+  for (; strlen; --strlen, ++str)
+    _html_char(sb, *str);
+  return sb;
+}
+
+strbuf strbuf_json_null(strbuf sb)
+{
+  strbuf_puts(sb, "null");
+  return sb;
+}
+
+strbuf strbuf_json_boolean(strbuf sb, int boolean)
+{
+  strbuf_puts(sb, boolean ? "true" : "false");
+  return sb;
+}
+
+static void _json_char(strbuf sb, char c)
+{
+  if (c == '"' || c == '\\') {
+    strbuf_putc(sb, '\\');
+    strbuf_putc(sb, c);
+  }
+  else if (c == '\b')
+    strbuf_puts(sb, "\\b");
+  else if (c == '\f')
+    strbuf_puts(sb, "\\f");
+  else if (c == '\n')
+    strbuf_puts(sb, "\\n");
+  else if (c == '\r')
+    strbuf_puts(sb, "\\r");
+  else if (c == '\t')
+    strbuf_puts(sb, "\\t");
+  else if (iscntrl(c))
+    strbuf_sprintf(sb, "\\u%04X", (unsigned char) c);
+  else
+    strbuf_putc(sb, c);
+}
+
+strbuf strbuf_json_string(strbuf sb, const char *str)
+{
+  if (str) {
+    strbuf_putc(sb, '"');
+    for (; *str; ++str)
+      _json_char(sb, *str);
+    strbuf_putc(sb, '"');
+  } else
+    strbuf_json_null(sb);
+  return sb;
+}
+
+strbuf strbuf_json_string_len(strbuf sb, const char *str, size_t strlen)
+{
+  strbuf_putc(sb, '"');
+  for (; strlen; --strlen, ++str)
+    _json_char(sb, *str);
+  strbuf_putc(sb, '"');
+  return sb;
+}
+
+strbuf strbuf_json_hex(strbuf sb, const unsigned char *buf, size_t len)
+{
+  if (buf) {
+    strbuf_putc(sb, '"');
+    size_t i;
+    for (i = 0; i != len; ++i) {
+      strbuf_putc(sb, hexdigit_upper[*buf >> 4]);
+      strbuf_putc(sb, hexdigit_upper[*buf++ & 0xf]);
+    }
+    strbuf_putc(sb, '"');
+  } else
+    strbuf_json_null(sb);
+  return sb;
+}
+
+strbuf strbuf_json_atom(strbuf sb, const struct json_atom *atom)
+{
+  switch (atom->type) {
+    case JSON_NULL:
+      return strbuf_json_null(sb);
+    case JSON_BOOLEAN:
+      return strbuf_json_boolean(sb, atom->u.boolean);
+    case JSON_INTEGER:
+      strbuf_sprintf(sb, "%"PRId64, atom->u.integer);
+      return sb;
+    case JSON_STRING_NULTERM:
+      return strbuf_json_string(sb, atom->u.string.content);
+    case JSON_STRING_LENGTH:
+      return strbuf_json_string_len(sb, atom->u.string.content, atom->u.string.length);
+  }
+  abort();
+}
+
+strbuf strbuf_json_atom_as_text(strbuf sb, const struct json_atom *atom)
+{
+  switch (atom->type) {
+    case JSON_NULL:
+      return strbuf_json_null(sb);
+    case JSON_BOOLEAN:
+      return strbuf_puts(sb, atom->u.boolean ? "True" : "False");
+    case JSON_INTEGER:
+      strbuf_sprintf(sb, "%"PRId64, atom->u.integer);
+      return sb;
+    case JSON_STRING_NULTERM:
+      return strbuf_puts(sb, atom->u.string.content);
+    case JSON_STRING_LENGTH:
+      return strbuf_ncat(sb, atom->u.string.content, atom->u.string.length);
+  }
+  abort();
+}
+
+strbuf strbuf_json_atom_as_html(strbuf sb, const struct json_atom *atom)
+{
+  switch (atom->type) {
+    case JSON_NULL:
+      return strbuf_json_null(sb);
+    case JSON_BOOLEAN:
+      return strbuf_json_boolean(sb, atom->u.boolean);
+    case JSON_INTEGER:
+      strbuf_sprintf(sb, "%"PRId64, atom->u.integer);
+      return sb;
+    case JSON_STRING_NULTERM:
+      return strbuf_html_escape(sb, atom->u.string.content, strlen(atom->u.string.content));
+    case JSON_STRING_LENGTH:
+      return strbuf_html_escape(sb, atom->u.string.content, atom->u.string.length);
+  }
+  abort();
+}
+
+strbuf strbuf_append_http_ranges(strbuf sb, const struct http_range *ranges, unsigned nels)
+{
+  unsigned i;
+  int first = 1;
+  for (i = 0; i != nels; ++i) {
+    const struct http_range *r = &ranges[i];
+    switch (r->type) {
+      case NIL: break;
+      case CLOSED:
+	strbuf_sprintf(sb, "%s%"PRIhttp_size_t"-%"PRIhttp_size_t, first ? "" : ",", r->first, r->last);
+	first = 0;
+	break;
+      case OPEN:
+	strbuf_sprintf(sb, "%s%"PRIhttp_size_t"-", first ? "" : ",", r->first);
+	first = 0;
+	break;
+      case SUFFIX:
+	strbuf_sprintf(sb, "%s-%"PRIhttp_size_t, first ? "" : ",", r->last);
+	first = 0;
+	break;
+    }
+  }
+  return sb;
+}
+
+strbuf strbuf_append_mime_content_type(strbuf sb, const struct mime_content_type *ct)
+{
+  strbuf_puts(sb, ct->type);
+  strbuf_putc(sb, '/');
+  strbuf_puts(sb, ct->subtype);
+  if (ct->charset) {
+    strbuf_puts(sb, "; charset=");
+    strbuf_append_quoted_string(sb, ct->charset);
+  }
+  if (ct->multipart_boundary) {
+    strbuf_puts(sb, "; boundary=");
+    strbuf_append_quoted_string(sb, ct->multipart_boundary);
+  }
+  return sb;
+}
+
+strbuf strbuf_append_mime_content_disposition(strbuf sb, const struct mime_content_disposition *cd)
+{
+  strbuf_puts(sb, cd->type);
+  if (cd->name) {
+    strbuf_puts(sb, "; name=");
+    strbuf_append_quoted_string(sb, cd->name);
+  }
+  if (cd->filename) {
+    strbuf_puts(sb, "; filename=");
+    strbuf_append_quoted_string(sb, cd->filename);
+  }
+  if (cd->size)
+    strbuf_sprintf(sb, "; size=%"PRIhttp_size_t, cd->size);
+  struct tm tm;
+  if (cd->creation_date) {
+    strbuf_puts(sb, " creation_date=");
+    strbuf_append_strftime(sb, "\"%a, %d %b %Y %T %z\"", gmtime_r(&cd->creation_date, &tm));
+  }
+  if (cd->modification_date) {
+    strbuf_puts(sb, " modification_date=");
+    strbuf_append_strftime(sb, "\"%a, %d %b %Y %T %z\"", gmtime_r(&cd->modification_date, &tm));
+  }
+  if (cd->read_date) {
+    strbuf_puts(sb, " read_date=");
+    strbuf_append_strftime(sb, "\"%a, %d %b %Y %T %z\"", gmtime_r(&cd->read_date, &tm));
+  }
   return sb;
 }

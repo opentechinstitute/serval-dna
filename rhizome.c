@@ -1,6 +1,7 @@
 /*
-Serval Distributed Numbering Architecture (DNA)
-Copyright (C) 2010 Paul Gardner-Stephen
+Serval DNA Rhizome file distribution
+Copyright (C) 2012-2013 Serval Project Inc.
+Copyright (C) 2011-2012 Paul Gardner-Stephen
  
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -17,11 +18,43 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
+/*
+  Portions Copyright (C) 2013 Petter Reinholdtsen
+  Some rights reserved
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in
+     the documentation and/or other materials provided with the
+     distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#include <stdlib.h>
+#include <assert.h>
 #include "serval.h"
 #include "conf.h"
 #include "str.h"
 #include "rhizome.h"
-#include <stdlib.h>
+#include "httpd.h"
+#include "dataformats.h"
 
 int is_rhizome_enabled()
 {
@@ -52,7 +85,7 @@ int is_rhizome_advertise_enabled()
   return config.rhizome.enable
     &&   config.rhizome.advertise.enable
     &&   rhizome_db
-    &&   (is_rhizome_http_server_running() || is_rhizome_mdp_server_running());
+    &&   (is_httpd_server_running() || is_rhizome_mdp_server_running());
 }
 
 int rhizome_fetch_delay_ms()
@@ -61,32 +94,28 @@ int rhizome_fetch_delay_ms()
 }
 
 /* Import a bundle from a pair of files, one containing the manifest and the optional other
-   containing the payload.  The logic is all in rhizome_bundle_import().  This function just wraps
-   that function and manages file and object buffers and lifetimes.
-*/
-
-int rhizome_bundle_import_files(rhizome_manifest *m, const char *manifest_path, const char *filepath)
+ * containing the payload.  The work is all done by rhizome_bundle_import() and
+ * rhizome_store_manifest().
+ */
+enum rhizome_bundle_status rhizome_bundle_import_files(rhizome_manifest *m, rhizome_manifest **mout, const char *manifest_path, const char *filepath)
 {
   if (config.debug.rhizome)
     DEBUGF("(manifest_path=%s, filepath=%s)",
 	manifest_path ? alloca_str_toprint(manifest_path) : "NULL",
 	filepath ? alloca_str_toprint(filepath) : "NULL");
   
-  unsigned char buffer[MAX_MANIFEST_BYTES];
-  int buffer_len=0;
+  size_t buffer_len = 0;
+  int ret = 0;
   
   // manifest has been appended to the end of the file.
   if (strcmp(manifest_path, filepath)==0){
     unsigned char marker[4];
-    int ret=0;
     FILE *f = fopen(filepath, "r");
     
     if (f == NULL)
       return WHYF_perror("Could not open manifest file %s for reading.", filepath);
-    
     if (fseek(f, -sizeof(marker), SEEK_END))
       ret=WHY_perror("Unable to seek to end of file");
-    
     if (ret==0){
       ret = fread(marker, 1, sizeof(marker), f);
       if (ret==sizeof(marker))
@@ -94,244 +123,218 @@ int rhizome_bundle_import_files(rhizome_manifest *m, const char *manifest_path, 
       else
 	ret=WHY_perror("Unable to read end of manifest marker");
     }
-    
     if (ret==0){
       if (marker[2]!=0x41 || marker[3]!=0x10)
 	ret=WHYF("Expected 0x4110 marker at end of file");
     }
-    
     if (ret==0){
       buffer_len = read_uint16(marker);
       if (buffer_len < 1 || buffer_len > MAX_MANIFEST_BYTES)
-	ret=WHYF("Invalid manifest length %d", buffer_len);
+	ret=WHYF("Invalid manifest length %zu", buffer_len);
     }
-    
     if (ret==0){
       if (fseek(f, -(buffer_len+sizeof(marker)), SEEK_END))
 	ret=WHY_perror("Unable to seek to end of file");
     }
-    
-    if (ret==0){
-      ret = fread(buffer, 1, buffer_len, f);
-      if (ret==buffer_len)
-	ret=0;
-      else
-	ret=WHY_perror("Unable to read manifest contents");
+    if (ret == 0 && fread(m->manifestdata, buffer_len, 1, f) != 1) {
+      if (ferror(f))
+	ret = WHYF("fread(%p,%zu,1,%s) error", m->manifestdata, buffer_len, alloca_str_toprint(filepath));
+      else if (feof(f))
+	ret = WHYF("fread(%p,%zu,1,%s) hit end of file", m->manifestdata, buffer_len, alloca_str_toprint(filepath));
     }
-    
     fclose(f);
-    
-    if (ret)
-      return ret;
-    
-    manifest_path=(char*)buffer;
-  }
-  
-  if (rhizome_read_manifest_file(m, manifest_path, buffer_len) == -1)
-    return WHY("could not read manifest file");
-  if (rhizome_manifest_verify(m))
-    return WHY("could not verify manifest");
-  
-  /* Make sure we store signatures */
-  // TODO, why do we need this? Why isn't the state correct from rhizome_read_manifest_file? 
-  // This feels like a hack...
-  m->manifest_bytes=m->manifest_all_bytes;
-  
-  int status = rhizome_import_file(m, filepath);
-  if (status<0)
-    return status;
-  
-  status = rhizome_manifest_check_duplicate(m, NULL, 0);
-  if (status)
-    return status;
-    
-  return rhizome_add_manifest(m, 1);
-}
-
-/* Import a bundle from a finalised manifest struct.  The dataFileName element must give the path
-   of a readable file containing the payload unless the payload is null (zero length).  The logic is
-   all in rhizome_add_manifest().  This function just wraps that function and manages object buffers
-   and lifetimes.
-*/
-
-int rhizome_bundle_import(rhizome_manifest *m, int ttl)
-{
-  if (config.debug.rhizome)
-    DEBUGF("(m=%p, ttl=%d)", m, ttl);
-  int ret = rhizome_manifest_check_duplicate(m, NULL, 0);
-  if (ret == 0) {
-    ret = rhizome_add_manifest(m, ttl);
-    if (ret == -1)
-      WHY("rhizome_add_manifest() failed");
-  }
-  return ret;
-}
-
-int rhizome_manifest_check_sanity(rhizome_manifest *m_in)
-{
-  /* Ensure manifest meets basic sanity checks. */
-  const char *service = rhizome_manifest_get(m_in, "service", NULL, 0);
-  const char *sender = rhizome_manifest_get(m_in, "sender", NULL, 0);
-  const char *recipient = rhizome_manifest_get(m_in, "recipient", NULL, 0);
-  
-  if (service == NULL || !service[0])
-      return WHY("Manifest missing 'service' field");
-  if (rhizome_manifest_get_ll(m_in, "date") == -1)
-      return WHY("Manifest missing 'date' field");
-  
-  /* Get manifest version number. */
-  m_in->version = rhizome_manifest_get_ll(m_in, "version");
-  if (m_in->version==-1)
-    return WHY("Manifest must have a version number");
-  
-  if (strcasecmp(service, RHIZOME_SERVICE_FILE) == 0) {
-    const char *name = rhizome_manifest_get(m_in, "name", NULL, 0);
-    if (name == NULL)
-      return WHY("Manifest missing 'name' field");
-  } else if (strcasecmp(service, RHIZOME_SERVICE_MESHMS) == 0) {
-    if (sender == NULL || !sender[0])
-      return WHY("MeshMS Manifest missing 'sender' field");
-    if (!str_is_subscriber_id(sender))
-      return WHYF("MeshMS Manifest contains invalid 'sender' field: %s", sender);
-    if (recipient == NULL || !recipient[0])
-      return WHY("MeshMS Manifest missing 'recipient' field");
-    if (!str_is_subscriber_id(recipient))
-      return WHYF("MeshMS Manifest contains invalid 'recipient' field: %s", recipient);
   } else {
-    return WHY("Invalid service type");
+    ssize_t size = read_whole_file(manifest_path, m->manifestdata, sizeof m->manifestdata);
+    if (size == -1)
+      ret = -1;
+    buffer_len = (size_t) size;
   }
-  if (config.debug.rhizome)
-    DEBUGF("sender='%s'", sender ? sender : "(null)");
-
-  /* passes all sanity checks */
-  return 0;
-}
-
-
-/*
-  A bundle can either be an ordinary manifest-payload pair, or a group description.
-  
-  - Group descriptions are manifests with no payload that have the "isagroup" variable set.  They
-    get stored in the manifests table AND a reference is added to the grouplist table.  Any
-    manifest, including any group manifest, may be a member of zero or one group.  This allows a
-    nested, i.e., multi-level group hierarchy where sub-groups will only typically be discovered
-    by joining the parent group.
-*/
-
-int rhizome_manifest_bind_id(rhizome_manifest *m_in)
-{
-  if (rhizome_manifest_createid(m_in) == -1)
-    return -1;
-  /* The ID is implicit in transit, but we need to store it in the file, so that reimporting
-     manifests on receiver nodes works easily.  We might implement something that strips the id
-     variable out of the manifest when sending it, or some other scheme to avoid sending all the
-     extra bytes. */
-  rhizome_manifest_set(m_in, "id", alloca_tohex_bid(m_in->cryptoSignPublic));
-  if (!is_sid_any(m_in->author)) {
-    /* Set the BK using the provided authorship information.
-       Serval Security Framework defines BK as being:
-       BK = privateKey XOR sha512(RS##BID), where BID = cryptoSignPublic, 
-       and RS is the rhizome secret for the specified author. 
-       The nice thing about this specification is that:
-       privateKey = BK XOR sha512(RS##BID), so the same function can be used
-       to encrypt and decrypt the BK field. */
-    const unsigned char *rs;
-    int rs_len=0;
-    unsigned char bkbytes[RHIZOME_BUNDLE_KEY_BYTES];
-
-    if (rhizome_find_secret(m_in->author,&rs_len,&rs)) {
-      return WHYF("Failed to obtain RS for %s to calculate BK",
-		 alloca_tohex_sid(m_in->author));
-    }
-    if (!rhizome_secret2bk(m_in->cryptoSignPublic,rs,rs_len,bkbytes,m_in->cryptoSignSecret)) {
-      char bkhex[RHIZOME_BUNDLE_KEY_STRLEN + 1];
-      (void) tohex(bkhex, bkbytes, RHIZOME_BUNDLE_KEY_BYTES);
-      if (config.debug.rhizome) DEBUGF("set BK=%s", bkhex);
-      rhizome_manifest_set(m_in, "BK", bkhex);
-    } else {
-      return WHY("Failed to set BK");
+  if (ret)
+    return ret;
+  m->manifest_all_bytes = buffer_len;
+  if (   rhizome_manifest_parse(m) == -1
+      || !rhizome_manifest_validate(m)
+      || !rhizome_manifest_verify(m)
+  )
+    return RHIZOME_BUNDLE_STATUS_INVALID;
+  enum rhizome_bundle_status status = rhizome_manifest_check_stored(m, mout);
+  if (status == RHIZOME_BUNDLE_STATUS_NEW) {
+    enum rhizome_payload_status pstatus = rhizome_import_payload_from_file(m, filepath);
+    switch (pstatus) {
+      case RHIZOME_PAYLOAD_STATUS_EMPTY:
+      case RHIZOME_PAYLOAD_STATUS_STORED:
+      case RHIZOME_PAYLOAD_STATUS_NEW:
+	if (rhizome_store_manifest(m) == -1)
+	  return -1;
+	break;
+      case RHIZOME_PAYLOAD_STATUS_ERROR:
+      case RHIZOME_PAYLOAD_STATUS_CRYPTO_FAIL:
+	return -1;
+      case RHIZOME_PAYLOAD_STATUS_WRONG_SIZE:
+      case RHIZOME_PAYLOAD_STATUS_WRONG_HASH:
+	status = RHIZOME_BUNDLE_STATUS_INCONSISTENT;
+	break;
+      default:
+	FATALF("pstatus = %d", pstatus);
     }
   }
-  return 0;
+  return status;
 }
 
-/* Check if a manifest is already stored for the same payload with the same details.
-   This catches the case of "rhizome add file <filename>" on the same file more than once.
-   (Debounce!) */
-int rhizome_manifest_check_duplicate(rhizome_manifest *m_in, rhizome_manifest **m_out, int check_author)
+/* Sets the bundle key "BK" field of a manifest.  Returns 1 if the field was set, 0 if not.
+ *
+ * This function must not be called unless the bundle secret is known.
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+int rhizome_manifest_add_bundle_key(rhizome_manifest *m)
 {
-  if (config.debug.rhizome) DEBUG("Checking for duplicate");
-  if (m_out) *m_out = NULL; 
-  rhizome_manifest *dupm = NULL;
-  if (rhizome_find_duplicate(m_in, &dupm, check_author) == -1)
-    return WHY("Errors encountered searching for duplicate manifest");
-  if (dupm) {
-    /* If the caller wants the duplicate manifest, it must be finalised, otherwise discarded. */
-    if (m_out) {
-      *m_out = dupm;
-    }
-    else
-      rhizome_manifest_free(dupm);
-    if (config.debug.rhizome) DEBUG("Found a duplicate");
-    return 2;
-  }
-  if (config.debug.rhizome) DEBUG("No duplicate found");
-  return 0;
-}
-
-int rhizome_add_manifest(rhizome_manifest *m_in,int ttl)
-{
-  if (config.debug.rhizome)
-    DEBUGF("rhizome_add_manifest(m_in=%p, ttl=%d)",m_in, ttl);
-
-  if (m_in->finalised==0)
-    return WHY("Manifest must be finalised before being stored");
-
-  /* Store time to live, clamped to within legal range */
-  m_in->ttl = ttl < 0 ? 0 : ttl > 254 ? 254 : ttl;
-
-  if (rhizome_manifest_check_sanity(m_in))
-    return -1;
-
-  if (m_in->fileLength){
-    if (!rhizome_exists(m_in->fileHexHash))
-      return WHY("File has not been imported");
-  }
-
-  /* If the manifest already has an ID */
-  char id[SID_STRLEN + 1];
-  if (!rhizome_manifest_get(m_in, "id", id, SID_STRLEN + 1))
-  /* no manifest ID */
-    return WHY("Manifest does not have an ID");   
-  
-  str_toupper_inplace(id);
-  /* Discard the new manifest unless it is newer than the most recent known version with the same ID */
-  long long storedversion = -1;
-  switch (sqlite_exec_int64(&storedversion, "SELECT version from manifests where id='%s';", id)) {
-    case -1:
-      return WHY("Select failed");
-    case 0:
-      if (config.debug.rhizome) DEBUG("No existing manifest");
+  IN();
+  assert(m->haveSecret);
+  switch (m->authorship) {
+    case ANONYMOUS: // there can be no BK field without an author
+    case AUTHOR_UNKNOWN: // we already know the author is not in the keyring
+    case AUTHENTICATION_ERROR: // already tried and failed to get Rhizome Secret
       break;
-    case 1:
-      if (config.debug.rhizome) DEBUGF("Found existing version=%lld, new version=%lld", storedversion, m_in->version);
-      if (m_in->version < storedversion)
-	return WHY("Newer version exists");
-      if (m_in->version == storedversion)
-	return WHY("Same version of manifest exists, not adding");
+    case AUTHOR_NOT_CHECKED:
+    case AUTHOR_LOCAL:
+    case AUTHOR_AUTHENTIC:
+    case AUTHOR_IMPOSTOR: {
+	/* Set the BK using the provided author.  Serval Security Framework defines BK as being:
+	*    BK = privateKey XOR sha512(RS##BID)
+	* where BID = cryptoSignPublic, 
+	*       RS is the rhizome secret for the specified author. 
+	* The nice thing about this specification is that:
+	*    privateKey = BK XOR sha512(RS##BID)
+	* so the same function can be used to encrypt and decrypt the BK field.
+	*/
+	const unsigned char *rs;
+	size_t rs_len = 0;
+	enum rhizome_secret_disposition d = find_rhizome_secret(&m->author, &rs_len, &rs);
+	switch (d) {
+	  case FOUND_RHIZOME_SECRET: {
+	      rhizome_bk_t bkey;
+	      if (rhizome_secret2bk(&m->cryptoSignPublic, rs, rs_len, bkey.binary, m->cryptoSignSecret) == 0) {
+		rhizome_manifest_set_bundle_key(m, &bkey);
+		m->authorship = AUTHOR_AUTHENTIC;
+		RETURN(1);
+	      } else
+		m->authorship = AUTHENTICATION_ERROR;
+	    }
+	    break;
+	  case IDENTITY_NOT_FOUND:
+	    m->authorship = AUTHOR_UNKNOWN;
+	    break;
+	  case IDENTITY_HAS_NO_RHIZOME_SECRET:
+	    m->authorship = AUTHENTICATION_ERROR;
+	    break;
+	  default:
+	    FATALF("find_rhizome_secret() returned unknown code %d", (int)d);
+	    break;
+	}
+      }
       break;
     default:
-      return WHY("Select found too many rows!");
+      FATALF("m->authorship = %d", (int)m->authorship);
   }
-
-  /* Okay, it is written, and can be put directly into the rhizome database now */
-  return rhizome_store_bundle(m_in);
+  rhizome_manifest_del_bundle_key(m);
+  switch (m->authorship) {
+    case AUTHOR_UNKNOWN:
+      WHYF("Cannot set BK because author=%s is not in keyring", alloca_tohex_sid_t(m->author));
+      break;
+    case AUTHENTICATION_ERROR:
+      WHY("Cannot set BK due to error");
+      break;
+    default:
+      break;
+  }
+  RETURN(0);
 }
 
-/* Update an existing Rhizome bundle */
-int rhizome_bundle_push_update(char *id,long long version,unsigned char *data,int appendP)
+/* Test the status of a given manifest 'm' (id, version) with respect to the Rhizome store, and
+ * return a code which indicates whether 'm' should be stored or not, setting *mout to 'm' or
+ * to point to a newly allocated manifest.  The caller is responsible for freeing *mout if *mout !=
+ * m.  If the caller passes mout==NULL then no new manifest is allocated.
+ *
+ *  - If the store contains no manifest with the given id, sets *mout = m and returns
+ *    RHIZOME_BUNDLE_STATUS_NEW, ie, the manifest 'm' should be stored.
+ *
+ *  - If the store contains a manifest with the same id and an older version, sets *mout to the
+ *    stored manifest and returns RHIZOME_BUNDLE_STATUS_NEW, ie, the manifest 'm' should be
+ *    stored.
+ *
+ *  - If the store contains a manifest with the same id and version, sets *mout to the stored
+ *    manifest and returns RHIZOME_BUNDLE_STATUS_SAME.  The caller must compare *m and *mout, and
+ *    if they are not identical, must decide what to do.
+ *
+ *  - If the store contains a manifest with the same id and a later version, sets *mout to the
+ *    stored manifest and returns RHIZOME_BUNDLE_STATUS_OLD, ie, the manifest 'm' should NOT be
+ *    stored.
+ *
+ *  - If there is an error querying the Rhizome store or allocating a new manifest structure, logs
+ *    an error and returns -1.
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+enum rhizome_bundle_status rhizome_manifest_check_stored(rhizome_manifest *m, rhizome_manifest **mout)
 {
-  return WHY("Not implemented");
+  assert(m->has_id);
+  assert(m->version != 0);
+  rhizome_manifest *stored_m = rhizome_new_manifest();
+  if (stored_m == NULL)
+    return -1;
+  int n = rhizome_retrieve_manifest(&m->cryptoSignPublic, stored_m);
+  switch (n) {
+    case -1:
+      rhizome_manifest_free(stored_m);
+      return -1;
+    case 1:
+      if (config.debug.rhizome)
+	DEBUGF("No stored manifest with id=%s", alloca_tohex_rhizome_bid_t(m->cryptoSignPublic));
+      rhizome_manifest_free(stored_m);
+      if (mout)
+	*mout = m;
+      return RHIZOME_BUNDLE_STATUS_NEW;
+    case 0:
+      break;
+    default:
+      FATALF("rhizome_retrieve_manifest() returned %d", n);
+  }
+  if (mout)
+    *mout = stored_m;
+  else
+    rhizome_manifest_free(stored_m);
+  enum rhizome_bundle_status result = RHIZOME_BUNDLE_STATUS_NEW;
+  const char *what = "newer than";
+  if (m->version < stored_m->version) {
+    result = RHIZOME_BUNDLE_STATUS_OLD;
+    what = "older than";
+  }
+  if (m->version == stored_m->version) {
+    return RHIZOME_BUNDLE_STATUS_SAME;
+    what = "same as";
+  }
+  if (config.debug.rhizome)
+    DEBUGF("Bundle %s:%"PRIu64" is %s stored version %"PRIu64, alloca_tohex_rhizome_bid_t(m->cryptoSignPublic), m->version, what, stored_m->version);
+  return result;
+}
+
+enum rhizome_bundle_status rhizome_add_manifest(rhizome_manifest *m, rhizome_manifest **mout)
+{
+  if (config.debug.rhizome)
+    DEBUGF("rhizome_add_manifest(m=manifest[%d](%p), mout=%p)", m->manifest_record_number, m, mout);
+  if (!m->finalised && !rhizome_manifest_validate(m))
+    return RHIZOME_BUNDLE_STATUS_INVALID;
+  assert(m->finalised);
+  if (!m->selfSigned && !rhizome_manifest_verify(m))
+    return RHIZOME_BUNDLE_STATUS_FAKE;
+  assert(m->filesize != RHIZOME_SIZE_UNSET);
+  if (m->filesize > 0 && !rhizome_exists(&m->filehash))
+    return WHY("Payload has not been stored");
+  enum rhizome_bundle_status status = rhizome_manifest_check_stored(m, mout);
+  if (status == RHIZOME_BUNDLE_STATUS_NEW && rhizome_store_manifest(m) == -1)
+    return -1;
+  return status;
 }
 
 /* When voice traffic is being carried, we need to throttle Rhizome down

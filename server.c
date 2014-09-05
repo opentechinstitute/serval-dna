@@ -17,24 +17,26 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
+#include <dirent.h>
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <libgen.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <sys/stat.h>
 
 #include "serval.h"
 #include "conf.h"
 #include "strbuf.h"
 #include "strbuf_helpers.h"
+#include "overlay_interface.h"
 
 #define PIDFILE_NAME	  "servald.pid"
 #define STOPFILE_NAME	  "servald.stop"
 
 #define EXEC_NARGS 20
 char *exec_args[EXEC_NARGS + 1];
-int exec_argc = 0;
+unsigned exec_argc = 0;
 
 int servalShutdown = 0;
 
@@ -42,7 +44,6 @@ static int server_getpid = 0;
 
 void signal_handler(int signal);
 void crash_handler(int signal);
-int getKeyring(char *s);
 
 /** Return the PID of the currently running server process, return 0 if there is none.
  */
@@ -50,20 +51,18 @@ int server_pid()
 {
   const char *instancepath = serval_instancepath();
   struct stat st;
-  if (stat(instancepath, &st) == -1) {
-    WHY_perror("stat");
-    return WHYF("Instance path '%s' non existant or not accessable"
-	" (Set SERVALINSTANCE_PATH to specify an alternate location)",
-	instancepath
-      );
-  }
+  if (stat(instancepath, &st) == -1)
+    return WHYF_perror("stat(%s)", alloca_str_toprint(instancepath));
   if ((st.st_mode & S_IFMT) != S_IFDIR)
     return WHYF("Instance path '%s' is not a directory", instancepath);
   char filename[1024];
   if (!FORM_SERVAL_INSTANCE_PATH(filename, PIDFILE_NAME))
     return -1;
-  FILE *f = NULL;
-  if ((f = fopen(filename, "r"))) {
+  FILE *f = fopen(filename, "r");
+  if (f == NULL) {
+    if (errno != ENOENT)
+      return WHYF_perror("fopen(%s,\"r\")", alloca_str_toprint(filename));
+  } else {
     char buf[20];
     int pid = (fgets(buf, sizeof buf, f) != NULL) ? atoi(buf) : -1;
     fclose(f);
@@ -78,12 +77,12 @@ int server_pid()
 void server_save_argv(int argc, const char *const *argv)
 {
     /* Save our argv[] to use for relaunching */
-    for (exec_argc = 0; exec_argc < argc && exec_argc < EXEC_NARGS; ++exec_argc)
+    for (exec_argc = 0; exec_argc < (unsigned)argc && exec_argc < EXEC_NARGS; ++exec_argc)
       exec_args[exec_argc] = strdup(argv[exec_argc]);
     exec_args[exec_argc] = NULL;
 }
 
-int server(char *backing_file)
+int server(const struct cli_parsed *parsed)
 {
   IN();
   /* For testing, it can be very helpful to delay the start of the server process, for example to
@@ -111,29 +110,85 @@ int server(char *backing_file)
   sigemptyset(&sig.sa_mask); // Block the same signals during handler
   sigaddset(&sig.sa_mask, SIGHUP);
   sigaddset(&sig.sa_mask, SIGINT);
-  sigaddset(&sig.sa_mask, SIGQUIT);
   sig.sa_flags = 0;
   sigaction(SIGHUP, &sig, NULL);
   sigaction(SIGINT, &sig, NULL);
-  sigaction(SIGQUIT, &sig, NULL);
 
+  overlayServerMode(parsed);
+
+  RETURN(0);
+  OUT();
+}
+
+int server_write_pid()
+{
   /* Record PID to advertise that the server is now running */
   char filename[1024];
   if (!FORM_SERVAL_INSTANCE_PATH(filename, PIDFILE_NAME))
-    RETURN(-1);
+    return -1;
   FILE *f=fopen(filename,"w");
   if (!f) {
     WHY_perror("fopen");
-    RETURN(WHYF("Could not write to PID file %s", filename));
+    return WHYF("Could not write to PID file %s", filename);
   }
   server_getpid = getpid();
   fprintf(f,"%d\n", server_getpid);
   fclose(f);
-  
-  overlayServerMode();
+  return 0;
+}
 
-  RETURN(0);
-  OUT();
+static int get_proc_path(const char *path, char *buff, size_t buff_len)
+{
+  strbuf sbname = strbuf_local(buff, buff_len);
+  strbuf_path_join(sbname, serval_instancepath(), "proc", path, NULL);
+  if (strbuf_overrun(sbname))
+    return WHY("Buffer overrun building proc filename");
+  return 0;
+}
+
+int server_write_proc_state(const char *path, const char *fmt, ...)
+{
+  char path_buf[400];
+  if (get_proc_path(path, path_buf, sizeof path_buf)==-1)
+    return -1;
+    
+  size_t dirsiz = strlen(path_buf) + 1;
+  char dir_buf[dirsiz];
+  strcpy(dir_buf, path_buf);
+  const char *dir = dirname(dir_buf); // modifies dir_buf[]
+  if (mkdirs(dir, 0700) == -1)
+    return WHY_perror("mkdirs()");
+  
+  FILE *f = fopen(path_buf, "w");
+  if (!f)
+    return WHY_perror("fopen()");
+  
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  
+  fclose(f);
+  return 0;
+}
+
+int server_get_proc_state(const char *path, char *buff, size_t buff_len)
+{
+  char path_buf[400];
+  if (get_proc_path(path, path_buf, sizeof path_buf)==-1)
+    return -1;
+  
+  FILE *f = fopen(path_buf, "r");
+  if (!f)
+    return -1;
+  
+  int ret=0;
+  
+  if (!fgets(buff, buff_len, f))
+    ret = WHY_perror("fgets");
+  
+  fclose(f);
+  return ret;
 }
 
 /* Called periodically by the server process in its main loop.
@@ -234,18 +289,47 @@ int server_check_stopfile()
   return -1;
 }
 
+static void clean_proc()
+{
+  char path_buf[400];
+  strbuf sbname = strbuf_local(path_buf, sizeof path_buf);
+  strbuf_path_join(sbname, serval_instancepath(), "proc", NULL);
+  
+  DIR *dir;
+  struct dirent *dp;
+  if ((dir = opendir(path_buf)) == NULL) {
+    WARNF_perror("opendir(%s)", alloca_str_toprint(path_buf));
+    return;
+  }
+  while ((dp = readdir(dir)) != NULL) {
+    strbuf_reset(sbname);
+    strbuf_path_join(sbname, serval_instancepath(), "proc", dp->d_name, NULL);
+    
+    struct stat st;
+    if (lstat(path_buf, &st)) {
+      WARNF_perror("stat(%s)", path_buf);
+      continue;
+    }
+    
+    if (S_ISREG(st.st_mode))
+      unlink(path_buf);
+  }
+}
+
 void serverCleanUp()
 {
+  if (serverMode){
+    rhizome_close_db();
+    dna_helper_shutdown();
+    overlay_interface_close_all();
+  }
+  
+  overlay_mdp_clean_socket_files();
+  
+  clean_proc();
+  
   /* Try to remove shutdown and PID files and exit */
   server_remove_stopfile();
-  char filename[1024];
-  if (FORM_SERVAL_INSTANCE_PATH(filename, PIDFILE_NAME))
-    unlink(filename);
-  
-  if (FORM_SERVAL_INSTANCE_PATH(filename, "mdp.socket")) {
-    unlink(filename);
-  }
-  dna_helper_shutdown();
 }
 
 static void signame(char *buf, size_t len, int signal)
@@ -357,12 +441,6 @@ static void signame(char *buf, size_t len, int signal)
 
 void signal_handler(int signal)
 {
-  char buf[80];
-  signame(buf, sizeof(buf), signal);
-  INFOF("Caught %s", buf);
- WHYF("The following clue may help: %s",crash_handler_clue); 
-  dump_stack();
-
   switch (signal) {
     case SIGHUP:
     case SIGINT:
@@ -370,10 +448,18 @@ void signal_handler(int signal)
 	 rather than here, so we first try to tell the mainline code to do so.  If, however, this is
 	 not the first time we have been asked to shut down, then we will do it here. */
       server_shutdown_check(NULL);
-      WHY("Asking Serval process to shutdown cleanly");
+      INFO("Attempting clean shutdown");
       servalShutdown = 1;
       return;
   }
+  
+  char buf[80];
+  signame(buf, sizeof(buf), signal);
+  
+  LOGF(LOG_LEVEL_FATAL, "Caught signal %s", buf);
+  LOGF(LOG_LEVEL_FATAL, "The following clue may help: %s",crash_handler_clue); 
+  dump_stack(LOG_LEVEL_FATAL);
+
   serverCleanUp();
   exit(0);
 }
@@ -383,15 +469,14 @@ void crash_handler(int signal)
 {
   char buf[80];
   signame(buf, sizeof(buf), signal);
-  WHYF("Caught %s", buf);
-  WHYF("The following clue may help: %s",crash_handler_clue);
-  dump_stack();
+  LOGF(LOG_LEVEL_FATAL, "Caught signal %s", buf);
+  LOGF(LOG_LEVEL_FATAL, "The following clue may help: %s",crash_handler_clue); 
+  dump_stack(LOG_LEVEL_FATAL);
+  
   BACKTRACE;
   if (config.server.respawn_on_crash) {
-    int i;
-    for(i=0;i<overlay_interface_count;i++)
-      if (overlay_interfaces[i].alarm.poll.fd>-1)
-	close(overlay_interfaces[i].alarm.poll.fd);
+    unsigned i;
+    overlay_interface_close_all();
     char execpath[160];
     if (get_self_executable_path(execpath, sizeof execpath) != -1) {
       strbuf b = strbuf_alloca(1024);
@@ -411,23 +496,4 @@ void crash_handler(int signal)
   // If that didn't work, then die normally.
   INFOF("exit(%d)", -signal);
   exit(-signal);
-} 
-
-int getKeyring(char *backing_file)
-{
- if (!backing_file)
-    {     
-      exit(WHY("Keyring requires a backing file"));
-    }
-  else
-    {
-      if (keyring) 
-	exit(WHY("Keyring being opened twice"));
-      keyring=keyring_open(backing_file);
-      /* unlock all entries with blank pins */
-      keyring_enter_pin(keyring, "");
-    }
- keyring_seed(keyring);
-
- return 0;
 }

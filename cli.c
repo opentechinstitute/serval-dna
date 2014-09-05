@@ -1,6 +1,6 @@
 /*
 Serval DNA command-line functions
-Copyright (C) 2010-2013 Serval Project, Inc.
+Copyright (C) 2010-2013 Serval Project Inc.
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -25,6 +25,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "serval.h"
 #include "rhizome.h"
 #include "strbuf_helpers.h"
+#include "dataformats.h"
 
 int cli_usage(const struct cli_schema *commands, XPRINTF xpf)
 {
@@ -43,7 +44,7 @@ int cli_usage_args(const int argc, const char *const *args, const struct cli_sch
   unsigned cmd;
   int matched_any = 0;
   for (cmd = 0; commands[cmd].function; ++cmd) {
-    unsigned opt;
+    int opt;
     const char *word;
     int matched = 1;
     for (opt = 0; matched && opt < argc && (word = commands[cmd].words[opt]); ++opt)
@@ -98,7 +99,7 @@ int cli_parse(const int argc, const char *const *args, const struct cli_schema *
     cmdpa.labelc = 0;
     cmdpa.varargi = -1;
     const char *pattern = NULL;
-    unsigned arg = 0;
+    int arg = 0;
     unsigned opt = 0;
     while ((pattern = commands[cmd].words[opt])) {
       //DEBUGF("cmd=%d opt=%d pattern='%s' args[arg=%d]='%s'", cmd, opt, pattern, arg, arg < argc ? args[arg] : "");
@@ -166,7 +167,7 @@ int cli_parse(const int argc, const char *const *args, const struct cli_schema *
 	  pattern += 1;
 	  patlen -= 2;
 	}
-	unsigned oarg = arg;
+	int oarg = arg;
 	const char *text = NULL;
 	const char *label = NULL;
 	unsigned labellen = 0;
@@ -194,7 +195,7 @@ int cli_parse(const int argc, const char *const *args, const struct cli_schema *
 	  // Look for a match.
 	  const char *prefix = NULL;
 	  unsigned prefixlen = 0;
-	  char prefixarglen = 0;
+	  unsigned prefixarglen = 0;
 	  const char *caret = strchr(word, '<');
 	  if (wordlen > 2 && caret && word[wordlen-1] == '>') {
 	    if ((prefixarglen = prefixlen = caret - word)) {
@@ -276,7 +277,7 @@ void _debug_cli_parsed(struct __sourceloc __whence, const struct cli_parsed *par
 {
   DEBUG_argv("command", parsed->argc, parsed->args);
   strbuf b = strbuf_alloca(1024);
-  int i;
+  unsigned i;
   for (i = 0; i < parsed->labelc; ++i) {
     const struct labelv *lab = &parsed->labelv[i];
     strbuf_sprintf(b, " %s=%s", alloca_toprint(-1, lab->label, lab->len), alloca_str_toprint(lab->text));
@@ -286,7 +287,7 @@ void _debug_cli_parsed(struct __sourceloc __whence, const struct cli_parsed *par
   DEBUGF("parsed%s", strbuf_str(b));
 }
 
-int cli_invoke(const struct cli_parsed *parsed, void *context)
+int cli_invoke(const struct cli_parsed *parsed, struct cli_context *context)
 {
   IN();
   int ret = parsed->commands[parsed->cmdi].function(parsed, context);
@@ -296,10 +297,10 @@ int cli_invoke(const struct cli_parsed *parsed, void *context)
 
 int _cli_arg(struct __sourceloc __whence, const struct cli_parsed *parsed, char *label, const char **dst, int (*validator)(const char *arg), char *defaultvalue)
 {
-  int labellen = strlen(label);
+  unsigned labellen = strlen(label);
   if (dst)
     *dst = defaultvalue;
-  int i;
+  unsigned i;
   for (i = 0; i < parsed->labelc; ++i) {
     if (parsed->labelv[i].len == labellen && strncasecmp(label, parsed->labelv[i].label, labellen) == 0) {
       const char *value = parsed->labelv[i].text;
@@ -339,17 +340,17 @@ int cli_optional_sid(const char *arg)
 
 int cli_optional_bundle_key(const char *arg)
 {
-  return !arg[0] || rhizome_str_is_bundle_key(arg);
+  return !arg[0] || str_to_rhizome_bk_t(NULL, arg) != -1;
 }
 
 int cli_manifestid(const char *arg)
 {
-  return rhizome_str_is_manifest_id(arg);
+  return str_to_rhizome_bid_t(NULL, arg) != -1;
 }
 
 int cli_fileid(const char *arg)
 {
-  return rhizome_str_is_file_hash(arg);
+  return str_to_rhizome_filehash_t(NULL, arg) != -1;
 }
 
 int cli_optional_bundle_crypt_key(const char *arg)

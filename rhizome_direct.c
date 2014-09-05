@@ -135,7 +135,7 @@ rhizome_direct_sync_request
 *rhizome_direct_new_sync_request(
 				 void (*transport_specific_dispatch_function)
 				 (struct rhizome_direct_sync_request *),
-				 int buffer_size,int interval, int mode, void *state)
+				 size_t buffer_size, int interval, int mode, void *state)
 {
   assert(mode&3);
 
@@ -191,22 +191,19 @@ int rhizome_direct_continue_sync_request(rhizome_direct_sync_request *r)
   if (r->cursor->size_high>=r->cursor->limit_size_high)
     {
       DEBUG("Out of bins");
-      if (memcmp(r->cursor->bid_low,r->cursor->limit_bid_high,
-		 RHIZOME_MANIFEST_ID_BYTES)>=0)
-	{
-	  DEBUG("out of BIDs");
-	  /* Sync has finished.
-	     The transport may have initiated one or more transfers, so
-	     we cannot declare the sync complete until we know the transport
-	     has finished transferring. */
-	  if (!r->bundle_transfers_in_progress)
-	    {
-	      /* seems that all is done */
-	      DEBUG("All done");
-	      return rhizome_direct_conclude_sync_request(r);
-	    } else 
-	    DEBUG("Stuck on in-progress transfers");
-	} else
+      if (cmp_rhizome_bid_t(&r->cursor->bid_low, &r->cursor->limit_bid_high) >= 0) {
+	DEBUG("out of BIDs");
+	/* Sync has finished.
+	    The transport may have initiated one or more transfers, so
+	    we cannot declare the sync complete until we know the transport
+	    has finished transferring. */
+	if (!r->bundle_transfers_in_progress) {
+	  /* seems that all is done */
+	  DEBUG("All done");
+	  return rhizome_direct_conclude_sync_request(r);
+	} else 
+	DEBUG("Stuck on in-progress transfers");
+      } else
 	DEBUGF("bid_low<limit_bid_high");
     }
 
@@ -263,8 +260,7 @@ int rhizome_direct_conclude_sync_request(rhizome_direct_sync_request *r)
   multiple versions of a given bundle introduces only a slight complication. 
 */
 
-rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response
-(unsigned char *buffer,int size, int max_response_bytes)
+rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response(unsigned char *buffer,int size, int max_response_bytes)
 {
   if (size<10) return NULL;
   if (size>65536) return NULL;
@@ -289,9 +285,9 @@ rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response
       rhizome_direct_bundle_iterator_free(&c);
       return NULL;
     }
-  DEBUGF("unpickled size_high=%lld, limit_size_high=%lld",
+  DEBUGF("unpickled size_high=%"PRId64", limit_size_high=%"PRId64,
 	 c->size_high,c->limit_size_high);
-  DEBUGF("c->buffer_size=%d",c->buffer_size);
+  DEBUGF("c->buffer_size=%zu",c->buffer_size);
 
   /* Get our list of BARs for the same cursor range */
   int us_count=rhizome_direct_bundle_iterator_fill(c,-1);
@@ -338,7 +334,7 @@ rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response
 	      RHIZOME_BAR_PREFIX_BYTES);
 	c->buffer_used+=1+RHIZOME_BAR_PREFIX_BYTES;
 	who=-1;
-	DEBUGF("They have previously unseen bundle %016llx*",
+	DEBUGF("They have previously unseen bundle %016"PRIx64"*",
 	       rhizome_bar_bidprefix_ll(&buffer[10+them*RHIZOME_BAR_BYTES]));
       } else if (relation>0) {
 	/* We have a bundle that they don't have any version of
@@ -350,14 +346,12 @@ rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response
 	      RHIZOME_BAR_PREFIX_BYTES);
 	c->buffer_used+=1+RHIZOME_BAR_PREFIX_BYTES;
 	who=+1;
-	DEBUGF("We have previously unseen bundle %016llx*",
+	DEBUGF("We have previously unseen bundle %016"PRIx64"*",
 	       rhizome_bar_bidprefix_ll(&usbuffer[10+us*RHIZOME_BAR_BYTES]));
       } else {
 	/* We each have a version of this bundle, so see whose is newer */
-	long long them_version
-	  =rhizome_bar_version(&buffer[10+them*RHIZOME_BAR_BYTES]);
-	long long us_version
-	  =rhizome_bar_version(&usbuffer[10+us*RHIZOME_BAR_BYTES]);
+	uint64_t them_version = rhizome_bar_version(&buffer[10+them*RHIZOME_BAR_BYTES]);
+	uint64_t us_version = rhizome_bar_version(&usbuffer[10+us*RHIZOME_BAR_BYTES]);
 	if (them_version>us_version) {
 	  /* They have the newer version of the bundle */
 	  c->buffer[c->buffer_offset_bytes+c->buffer_used]=0x01; /* Please send */
@@ -365,10 +359,10 @@ rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response
 		&c->buffer[c->buffer_offset_bytes+c->buffer_used+1],
 		RHIZOME_BAR_PREFIX_BYTES);
 	  c->buffer_used+=1+RHIZOME_BAR_PREFIX_BYTES;
-	  DEBUGF("They have newer version of bundle %016llx* (%lld versus %lld)",
+	  DEBUGF("They have newer version of bundle %016"PRIx64"* (%"PRIu64" versus %"PRIu64")",
 		 rhizome_bar_bidprefix_ll(&usbuffer[10+us*RHIZOME_BAR_BYTES]),
-		 rhizome_bar_version(&usbuffer[10+us*RHIZOME_BAR_BYTES]),
-		 rhizome_bar_version(&buffer[10+them*RHIZOME_BAR_BYTES]));
+		 them_version,
+		 us_version);
 	} else if (them_version<us_version) {
 	  /* We have the newer version of the bundle */
 	  c->buffer[c->buffer_offset_bytes+c->buffer_used]=0x02; /* I have [newer] */
@@ -376,12 +370,12 @@ rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response
 		&c->buffer[c->buffer_offset_bytes+c->buffer_used+1],
 		RHIZOME_BAR_PREFIX_BYTES);
 	  c->buffer_used+=1+RHIZOME_BAR_PREFIX_BYTES;
-	  DEBUGF("We have newer version of bundle %016llx* (%lld versus %lld)",
+	  DEBUGF("We have newer version of bundle %016"PRIx64"* (%"PRIu64" versus %"PRIu64")",
 		 rhizome_bar_bidprefix_ll(&usbuffer[10+us*RHIZOME_BAR_BYTES]),
-		 rhizome_bar_version(&usbuffer[10+us*RHIZOME_BAR_BYTES]),
-		 rhizome_bar_version(&buffer[10+them*RHIZOME_BAR_BYTES]));
+		 us_version,
+		 them_version);
 	} else {
-	  DEBUGF("We both have the same version of %016llx*",
+	  DEBUGF("We both have the same version of %016"PRIx64"*",
 		 rhizome_bar_bidprefix_ll(&buffer[10+them*RHIZOME_BAR_BYTES]));
 	}
       }
@@ -397,7 +391,7 @@ rhizome_direct_bundle_cursor *rhizome_direct_get_fill_response
   return c;
 }
 
-rhizome_manifest *rhizome_direct_get_manifest(unsigned char *bid_prefix,int prefix_length)
+rhizome_manifest *rhizome_direct_get_manifest(unsigned char *bid_prefix, size_t prefix_length)
 {
   /* Give a BID prefix, e.g., from a BAR, find the matching manifest and return it.
      Of course, it is possible that more than one manifest matches.  This should
@@ -411,24 +405,18 @@ rhizome_manifest *rhizome_direct_get_manifest(unsigned char *bid_prefix,int pref
      Easiest way is to select with a BID range.  We could instead have an extra
      database column with the prefix.
   */
-  assert(prefix_length>=0);
-  assert(prefix_length<=RHIZOME_MANIFEST_ID_BYTES);
-  unsigned char low[RHIZOME_MANIFEST_ID_BYTES];
-  unsigned char high[RHIZOME_MANIFEST_ID_BYTES];
-
-  memset(low,0x00,RHIZOME_MANIFEST_ID_BYTES);
-  memset(high,0xff,RHIZOME_MANIFEST_ID_BYTES);
-  bcopy(bid_prefix,low,prefix_length);
-  bcopy(bid_prefix,high,prefix_length);
-
-  char query[1024];
-  snprintf(query,1024,"SELECT MANIFEST,ROWID FROM MANIFESTS WHERE ID>='%s' AND ID<='%s'",
-	   alloca_tohex(low,RHIZOME_MANIFEST_ID_BYTES),
-	   alloca_tohex(high,RHIZOME_MANIFEST_ID_BYTES));
-  
+  rhizome_bid_t low = RHIZOME_BID_ZERO;
+  rhizome_bid_t high = RHIZOME_BID_MAX;
+  assert(prefix_length <= sizeof(rhizome_bid_t));
+  bcopy(bid_prefix, low.binary, prefix_length);
+  bcopy(bid_prefix, high.binary, prefix_length);
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
-  sqlite3_stmt *statement = sqlite_prepare(&retry, query);
-  sqlite3_blob *blob=NULL;  
+  sqlite3_stmt *statement = sqlite_prepare_bind(&retry,
+      "SELECT manifest, rowid FROM MANIFESTS WHERE id >= ? AND id <= ?",
+      RHIZOME_BID_T, &low,
+      RHIZOME_BID_T, &high,
+      END);
+  sqlite3_blob *blob=NULL;
   if (sqlite_step_retry(&retry, statement) == SQLITE_ROW)
     {
       int ret;
@@ -450,14 +438,20 @@ rhizome_manifest *rhizome_direct_get_manifest(unsigned char *bid_prefix,int pref
       if (manifestblobsize<1||manifestblobsize>1024) goto error;
 
       const char *manifestblob = (char *) sqlite3_column_blob(statement, 0);
-      if (!manifestblob) goto error;
+      if (!manifestblob)
+	goto error;
 
-      rhizome_manifest *m=rhizome_new_manifest();
-      if (rhizome_read_manifest_file(m,manifestblob,manifestblobsize)==-1)
-	{
-	  rhizome_manifest_free(m);
-	  goto error;
-	}
+      rhizome_manifest *m = rhizome_new_manifest();
+      if (!m)
+	goto error;
+      memcpy(m->manifestdata, manifestblob, manifestblobsize);
+      m->manifest_all_bytes = manifestblobsize;
+      if (   rhizome_manifest_parse(m) == -1
+	  || !rhizome_manifest_validate(m)
+      ) {
+	rhizome_manifest_free(m);
+	goto error;
+      }
       
       DEBUGF("Read manifest");
       sqlite3_blob_close(blob);
@@ -510,7 +504,7 @@ static int rhizome_sync_with_peers(int mode, int peer_count, const struct config
   return 0;
 }
 
-int app_rhizome_direct_sync(const struct cli_parsed *parsed, void *context)
+int app_rhizome_direct_sync(const struct cli_parsed *parsed, struct cli_context *UNUSED(context))
 {
   if (config.debug.verbose)
     DEBUG_cli_parsed(parsed);
@@ -537,14 +531,14 @@ int app_rhizome_direct_sync(const struct cli_parsed *parsed, void *context)
     return -1;
   } else {
     const struct config_rhizome_peer *peers[config.rhizome.direct.peer.ac];
-    int i;
+    unsigned i;
     for (i = 0; i < config.rhizome.direct.peer.ac; ++i)
       peers[i] = &config.rhizome.direct.peer.av[i].value;
     return rhizome_sync_with_peers(mode, config.rhizome.direct.peer.ac, peers);
   }
 }
 
-rhizome_direct_bundle_cursor *rhizome_direct_bundle_iterator(int buffer_size)
+rhizome_direct_bundle_cursor *rhizome_direct_bundle_iterator(size_t buffer_size)
 {
   rhizome_direct_bundle_cursor *r=calloc(sizeof(rhizome_direct_bundle_cursor),1);
   assert(r!=NULL);
@@ -564,9 +558,8 @@ rhizome_direct_bundle_cursor *rhizome_direct_bundle_iterator(int buffer_size)
 void rhizome_direct_bundle_iterator_unlimit(rhizome_direct_bundle_cursor *r)
 {
   assert(r!=NULL);
-
   r->limit_size_high=1LL<<48LL;
-  memset(r->limit_bid_high,0xff,RHIZOME_MANIFEST_ID_BYTES);
+  r->limit_bid_high = RHIZOME_BID_MAX;
   return;
 }
 
@@ -593,19 +586,19 @@ int rhizome_direct_bundle_iterator_pickle_range(rhizome_direct_bundle_cursor *r,
      ranges, which will happen with every rhizome direct sync.
   */
 
-  long long v;
+  int64_t v;
   int ltwov=0;
 
   v=r->start_size_high;
   while(v>1) { ltwov++; v=v>>1; }
   pickled[0]=ltwov;
-  for(v=0;v<4;v++) pickled[1+v]=r->start_bid_low[v];
+  for(v=0;v<4;v++) pickled[1+v]=r->start_bid_low.binary[v];
   v=r->size_high;
-  DEBUGF("pickling size_high=%lld",r->size_high);
+  DEBUGF("pickling size_high=%"PRId64,r->size_high);
   ltwov=0;
   while(v>1) { ltwov++; v=v>>1; }
   pickled[1+4]=ltwov;
-  for(v=0;v<4;v++) pickled[1+4+1+v]=r->bid_high[v];
+  for(v=0;v<4;v++) pickled[1+4+1+v]=r->bid_high.binary[v];
 
   return 1+4+1+4;
 }
@@ -626,13 +619,13 @@ int rhizome_direct_bundle_iterator_unpickle_range(rhizome_direct_bundle_cursor *
   r->size_high=1LL<<pickled[0];
   r->size_low=(r->size_high/2)+1;
   if (r->size_high<=1024) r->size_low=0;
-  for(v=0;v<4;v++) r->bid_low[v]=pickled[1+v];
-  for(;v<RHIZOME_MANIFEST_ID_BYTES;v++) r->bid_low[v]=0x00;
+  r->bid_low = RHIZOME_BID_ZERO;
+  for (v=0;v<4;v++) r->bid_low.binary[v]=pickled[1+v];
 
   /* Get end of range */
   r->limit_size_high=1LL<<pickled[1+4];
-  for(v=0;v<4;v++) r->limit_bid_high[v]=pickled[1+4+1+v];
-  for(;v<RHIZOME_MANIFEST_ID_BYTES;v++) r->limit_bid_high[v]=0xff;
+  r->limit_bid_high = RHIZOME_BID_MAX;
+  for (v=0;v<4;v++) r->limit_bid_high.binary[v]=pickled[1+4+1+v];
 
   return 0;
 }
@@ -654,14 +647,14 @@ int rhizome_direct_bundle_iterator_fill(rhizome_direct_bundle_cursor *c,int max_
   */
   /* This is the only information required to remember where we started: */
   c->start_size_high=c->size_high;
-  bcopy(c->bid_low,c->start_bid_low,RHIZOME_MANIFEST_ID_BYTES);
+  c->start_bid_low = c->bid_low;
   c->buffer_offset_bytes=1+4+1+4; /* space for pickled cursor range */
 
   /* -1 is magic value for fill right up */
   if (max_bars==-1)
     max_bars=(c->buffer_size-c->buffer_offset_bytes)/RHIZOME_BAR_BYTES;
 
-  DEBUGF("Iterating cursor size high %lld..%lld, max_bars=%d",
+  DEBUGF("Iterating cursor size high %"PRId64"..%"PRId64", max_bars=%d",
 	 c->size_high,c->limit_size_high,max_bars);
 
   while (bundles_stuffed<max_bars&&c->size_high<=c->limit_size_high) 
@@ -675,17 +668,15 @@ int rhizome_direct_bundle_iterator_fill(rhizome_direct_bundle_cursor *c,int max_
 	 If we are not yet at the bundle data size limit, then any bundle is okay.
 	 If we are at the bundle data size limit, then we need to honour
 	 c->limit_bid_high. */
-      unsigned char bid_max[RHIZOME_MANIFEST_ID_BYTES];
-      if (c->size_high==c->limit_size_high)
-	bcopy(c->limit_bid_high,bid_max,RHIZOME_MANIFEST_ID_BYTES);
+      rhizome_bid_t bid_max;
+      if (c->size_high == c->limit_size_high)
+	bid_max = c->limit_bid_high;
       else
-	memset(bid_max,0xff,RHIZOME_MANIFEST_ID_BYTES);
-
-      int stuffed_now=rhizome_direct_get_bars(c->bid_low,c->bid_high,
-					      c->size_low,c->size_high,
-					      bid_max,
-					      &c->buffer[c->buffer_used
-							 +c->buffer_offset_bytes],
+	bid_max = RHIZOME_BID_MAX;
+      int stuffed_now=rhizome_direct_get_bars(&c->bid_low, &c->bid_high,
+					      c->size_low, c->size_high,
+					      &bid_max,
+					      &c->buffer[c->buffer_used + c->buffer_offset_bytes],
 					      stuffable);
       bundles_stuffed+=stuffed_now;
       c->buffer_used+=RHIZOME_BAR_BYTES*stuffed_now;
@@ -694,22 +685,21 @@ int rhizome_direct_bundle_iterator_fill(rhizome_direct_bundle_cursor *c,int max_
 	c->size_low=c->size_high+1;
 	c->size_high*=2;
 	if (c->size_high<=1024) c->size_low=0;
-	DEBUGF("size=%lld..%lld",c->size_low,c->size_high);
+	DEBUGF("size=%"PRId64"..%"PRId64,c->size_low,c->size_high);
 	/* Record that we covered to the end of that size bin */
-	memset(c->bid_high,0xff,RHIZOME_MANIFEST_ID_BYTES);
+	c->bid_high = RHIZOME_BID_MAX;
 	if (c->size_high>c->limit_size_high)
-	  memset(c->bid_low,0xff,RHIZOME_MANIFEST_ID_BYTES);
+	  c->bid_low = RHIZOME_BID_MAX;
 	else
-	  memset(c->bid_low,0x00,RHIZOME_MANIFEST_ID_BYTES);
+	  c->bid_low = RHIZOME_BID_ZERO;
       } else {
 	/* Continue from next BID */
-	bcopy(c->bid_high,c->bid_low,RHIZOME_MANIFEST_ID_BYTES);
+	c->bid_low = c->bid_high;
 	int i;
-	for(i=RHIZOME_BAR_BYTES-1;i>=0;i--)
-	  {
-	    c->bid_low[i]++;
-	    if (c->bid_low[i]) break;
-	  }
+	for(i=RHIZOME_BAR_BYTES-1;i>=0;i--) {
+	  if (++c->bid_low.binary[i])
+	    break;
+	}
 	if (i<0) break;
       }
     }  
@@ -743,31 +733,28 @@ void rhizome_direct_bundle_iterator_free(rhizome_direct_bundle_cursor **c)
    it is possible to make provably complete comparison of the contents
    of the respective rhizome databases.
 */
-int rhizome_direct_get_bars(const unsigned char bid_low[RHIZOME_MANIFEST_ID_BYTES],
-			    unsigned char bid_high[RHIZOME_MANIFEST_ID_BYTES],
-			    long long size_low,long long size_high,
-			    const unsigned char bid_max[RHIZOME_MANIFEST_ID_BYTES],
+int rhizome_direct_get_bars(const rhizome_bid_t *bidp_low,
+			    rhizome_bid_t *bidp_high,
+			    int64_t size_low, int64_t size_high,
+			    const rhizome_bid_t *bidp_max,
 			    unsigned char *bars_out,
 			    int bars_requested)
 {
   sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
-  char query[1024];
 
-  snprintf(query,1024,
-	   "SELECT BAR,ROWID,ID,FILESIZE FROM MANIFESTS"
-	   " WHERE"
-	   " FILESIZE BETWEEN %lld AND %lld"
-	   " AND ID>='%s' AND ID<='%s'"
-	   // The following formulation doesn't remove the weird returning of
-	   // bundles with out of range filesize values
-	   //	   " WHERE ID>='%s' AND ID<='%s' AND FILESIZE > %lld AND FILESIZE < %lld"
-	   " ORDER BY BAR LIMIT %d;",
-	   size_low, size_high,
-	   alloca_tohex(bid_low,RHIZOME_MANIFEST_ID_BYTES),
-	   alloca_tohex(bid_max,RHIZOME_MANIFEST_ID_BYTES),
-	   bars_requested);
-
-  sqlite3_stmt *statement=sqlite_prepare(&retry, query);
+  sqlite3_stmt *statement = sqlite_prepare_bind(&retry,
+      "SELECT bar, rowid, id, filesize FROM MANIFESTS"
+      " WHERE filesize BETWEEN ? AND ? AND id >= ? AND id <= ?"
+      " ORDER BY bar LIMIT ?;",
+      INT64, size_low,
+      INT64, size_high,
+      RHIZOME_BID_T, bidp_low,
+      RHIZOME_BID_T, bidp_max,
+      INT, bars_requested,
+      // The following formulation doesn't remove the weird returning of
+      // bundles with out of range filesize values
+      // " WHERE id >= ? AND id <= ? AND filesize > ? AND filesize < ?"
+      END);
   sqlite3_blob *blob=NULL;  
 
   int bars_written=0;
@@ -784,8 +771,7 @@ int rhizome_direct_get_bars(const unsigned char bid_low[RHIZOME_MANIFEST_ID_BYTE
 	int ret;
 	int64_t filesize = sqlite3_column_int64(statement, 3);
 	if (filesize<size_low||filesize>size_high) {
-	  DEBUGF("WEIRDNESS ALERT: filesize=%lld, but query was: %s",
-		 filesize,query);
+	  DEBUGF("WEIRDNESS ALERT: filesize=%"PRId64", but query was: %s", filesize, sqlite3_sql(statement));
 	  break;
 	} 
 	int64_t rowid = sqlite3_column_int64(statement, 1);
@@ -813,9 +799,7 @@ int rhizome_direct_get_bars(const unsigned char bid_low[RHIZOME_MANIFEST_ID_BYTE
 
 	/* Remember the BID so that we cant write it into bid_high so that the
 	   caller knows how far we got. */
-	fromhex(bid_high,
-		(const char *)sqlite3_column_text(statement, 2),
-		RHIZOME_MANIFEST_ID_BYTES);
+	str_to_rhizome_bid_t(bidp_high, (const char *)sqlite3_column_text(statement, 2));
 
 	bars_written++;
 	break;
@@ -831,4 +815,4 @@ int rhizome_direct_get_bars(const unsigned char bid_low[RHIZOME_MANIFEST_ID_BYTE
   
   return bars_written;
 }
-  
+

@@ -1,5 +1,6 @@
 /*
-Copyright (C) 2010-2012 Paul Gardner-Stephen, Serval Project.
+Copyright (C) 2010-2012 Paul Gardner-Stephen
+Copyright (C) 2010-2013 Serval Project Inc.
  
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -28,147 +29,129 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "rhizome.h"
 #include "crypto.h"
 #include "log.h"
+#include "keyring.h"
+#include "dataformats.h"
 
-int overlay_mdp_service_rhizomerequest(overlay_mdp_frame *mdp)
+int rhizome_mdp_send_block(struct subscriber *dest, const rhizome_bid_t *bid, uint64_t version, uint64_t fileOffset, uint32_t bitmap, uint16_t blockLength)
 {
   IN();
-
-  uint64_t version=
-    read_uint64(&mdp->out.payload[RHIZOME_MANIFEST_ID_BYTES]);
-  uint64_t fileOffset=
-    read_uint64(&mdp->out.payload[RHIZOME_MANIFEST_ID_BYTES+8]);
-  uint32_t bitmap=
-    read_uint32(&mdp->out.payload[RHIZOME_MANIFEST_ID_BYTES+8+8]);
-  uint16_t blockLength=
-    read_uint16(&mdp->out.payload[RHIZOME_MANIFEST_ID_BYTES+8+8+4]);
-  if (blockLength>1024) RETURN(-1);
-
-  struct subscriber *source = find_subscriber(mdp->out.src.sid, SID_SIZE, 0);
-  
-  if (config.debug.rhizome_tx)
-    DEBUGF("Requested blocks for %s @%llx", alloca_tohex_bid(&mdp->out.payload[0]), fileOffset);
-
-  /* Find manifest that corresponds to BID and version.
-     If we don't have this combination, then do nothing.
-     If we do have the combination, then find the associated file, 
-     and open the blob so that we can send some of it.
-
-     TODO: If we have a newer version of the manifest, and the manifest is a
-     journal, then the newer version is okay to use to service this request.
-  */
-  
-  char filehash[SHA512_DIGEST_STRING_LENGTH];
-  if (rhizome_database_filehash_from_id(alloca_tohex_bid(mdp->out.payload), version, filehash)<=0)
+  if (!is_rhizome_mdp_server_running())
     RETURN(-1);
-  
-  struct rhizome_read read;
-  bzero(&read, sizeof read);
-  
-  int ret=rhizome_open_read(&read, filehash, 0);
-  
-  if (!ret){
-    overlay_mdp_frame reply;
-    bzero(&reply,sizeof(reply));
-    // Reply is broadcast, so we cannot authcrypt, and signing is too time consuming
-    // for low devices.  The result is that an attacker can prevent rhizome transfers
-    // if they want to by injecting fake blocks.  The alternative is to not broadcast
-    // back replies, and then we can authcrypt.
-    // multiple receivers starting at different times, we really need merkle-tree hashing.
-    // so multiple receivers is not realistic for now.  So use non-broadcast unicode
-    // for now would seem the safest.  But that would stop us from allowing multiple
-    // receivers in the special case where additional nodes begin listening in from the
-    // beginning.
-    reply.packetTypeAndFlags=MDP_TX|MDP_NOCRYPT|MDP_NOSIGN;
-    bcopy(my_subscriber->sid,reply.out.src.sid,SID_SIZE);
-    reply.out.src.port=MDP_PORT_RHIZOME_RESPONSE;
-    int send_broadcast=1;
-    
-    if (source){
-      if (!(source->reachable&REACHABLE_DIRECT))
-	send_broadcast=0;
-      if (source->reachable&REACHABLE_UNICAST && source->interface && source->interface->prefer_unicast)
-	send_broadcast=0;
-    }
-    
-    if (send_broadcast){
-      // send replies to broadcast so that others can hear blocks and record them
-      // (not that preemptive listening is implemented yet).
-      memset(reply.out.dst.sid,0xff,SID_SIZE);
-      reply.out.ttl=1;
-    }else{
-      // if we get a request from a peer that we can only talk to via unicast, send data via unicast too.
-      bcopy(mdp->out.src.sid,reply.out.dst.sid,SID_SIZE);
-      reply.out.ttl=64;
-    }
-    
-    reply.out.dst.port=MDP_PORT_RHIZOME_RESPONSE;
-    reply.out.queue=OQ_OPPORTUNISTIC;
-    reply.out.payload[0]='B'; // reply contains blocks
-    // include 16 bytes of BID prefix for identification
-    bcopy(&mdp->out.payload[0],&reply.out.payload[1],16);
-    // and version of manifest
-    bcopy(&mdp->out.payload[RHIZOME_MANIFEST_ID_BYTES],
-	  &reply.out.payload[1+16],8);
-    
-    int i;
-    for(i=0;i<32;i++){
-      if (bitmap&(1<<(31-i)))
-	continue;
-      
-      if (overlay_queue_remaining(reply.out.queue) < 10)
-	break;
-      
-      // calculate and set offset of block
-      read.offset = fileOffset+i*blockLength;
-      
-      // stop if we passed the length of the file
-      // (but we may not know the file length until we attempt a read)
-      if (read.length!=-1 && read.offset>read.length)
-	break;
-      
-      write_uint64(&reply.out.payload[1+16+8], read.offset);
-      
-      int bytes_read = rhizome_read(&read, &reply.out.payload[1+16+8+8], blockLength);
-      if (bytes_read<=0)
-	break;
-      
-      reply.out.payload_length=1+16+8+8+bytes_read;
-      
-      // Mark the last block of the file, if required
-      if (read.offset >= read.length)
-	reply.out.payload[0]='T';
-      
-      // send packet
-      if (overlay_mdp_dispatch(&reply,0 /* system generated */, NULL,0))
-	break;
-    }
-  }
-  rhizome_read_close(&read);
+  if (blockLength<=0 || blockLength>1024)
+    RETURN(WHYF("Invalid block length %d", blockLength));
 
-  RETURN(ret);
+  if (config.debug.rhizome_tx)
+    DEBUGF("Requested blocks for bid=%s, ver=%"PRIu64" @%"PRIx64" bitmap %x", alloca_tohex_rhizome_bid_t(*bid), version, fileOffset, bitmap);
+    
+  struct internal_mdp_header header;
+  bzero(&header, sizeof header);
+  
+  uint8_t buff[MDP_MTU];
+  struct overlay_buffer *payload = ob_static(buff, sizeof(buff));
+  
+  // Reply is broadcast, so we cannot authcrypt, and signing is too time consuming
+  // for low devices.  The result is that an attacker can prevent rhizome transfers
+  // if they want to by injecting fake blocks.  The alternative is to not broadcast
+  // back replies, and then we can authcrypt.
+  // multiple receivers starting at different times, we really need merkle-tree hashing.
+  // so multiple receivers is not realistic for now.  So use non-broadcast unicode
+  // for now would seem the safest.  But that would stop us from allowing multiple
+  // receivers in the special case where additional nodes begin listening in from the
+  // beginning.
+  
+  header.crypt_flags = MDP_FLAG_NO_CRYPT | MDP_FLAG_NO_SIGN;
+  header.source = my_subscriber;
+  header.source_port = MDP_PORT_RHIZOME_RESPONSE;
+  
+  if (dest && (dest->reachable==REACHABLE_UNICAST || dest->reachable==REACHABLE_INDIRECT)){
+    // if we get a request from a peer that we can only talk to via unicast, send data via unicast too.
+    header.destination = dest;
+  }else{
+    // send replies to broadcast so that others can hear blocks and record them
+    // (not that preemptive listening is implemented yet).
+    header.ttl = 1;
+  }
+  
+  header.destination_port = MDP_PORT_RHIZOME_RESPONSE;
+  header.qos = OQ_OPPORTUNISTIC;
+  
+  int i;
+  for(i=0;i<32;i++){
+    if (bitmap&(1<<(31-i)))
+      continue;
+    
+    if (overlay_queue_remaining(header.qos) < 10)
+      break;
+    
+    // calculate and set offset of block
+    uint64_t offset = fileOffset+i*blockLength;
+    ob_clear(payload);
+    ob_append_byte(payload, 'B'); // contains blocks
+    // include 16 bytes of BID prefix for identification
+    ob_append_bytes(payload, bid->binary, 16);
+    // and version of manifest (in the correct byte order)
+    ob_append_ui64_rv(payload, version);
+    
+    ob_append_ui64_rv(payload, offset);
+    
+    ssize_t bytes_read = rhizome_read_cached(bid, version, gettime_ms()+5000, offset, ob_current_ptr(payload), blockLength);
+    if (bytes_read<=0)
+      break;
+    
+    ob_append_space(payload, bytes_read);
+    
+    // Mark the last block of the file, if required
+    if ((size_t)bytes_read < blockLength)
+      ob_set(payload, 0, 'T');
+    
+    // send packet
+    ob_flip(payload);
+    if (overlay_send_frame(&header, payload))
+      break;
+  }
+  ob_free(payload);
+  
+  RETURN(0);
   OUT();
 }
 
-int overlay_mdp_service_rhizomeresponse(overlay_mdp_frame *mdp)
+int overlay_mdp_service_rhizomerequest(struct internal_mdp_header *header, struct overlay_buffer *payload)
+{
+  const rhizome_bid_t *bidp = (const rhizome_bid_t *) ob_get_bytes_ptr(payload, sizeof bidp->binary);
+  // Note, was originally built using read_uint64 which has reverse byte order of ob_get_ui64
+  uint64_t version = ob_get_ui64_rv(payload);
+  uint64_t fileOffset = ob_get_ui64_rv(payload);
+  uint32_t bitmap = ob_get_ui32_rv(payload);
+  uint16_t blockLength = ob_get_ui16_rv(payload);
+  if (ob_overrun(payload))
+    return -1;
+  return rhizome_mdp_send_block(header->source, bidp, version, fileOffset, bitmap, blockLength);
+}
+
+int overlay_mdp_service_rhizomeresponse(struct internal_mdp_header *UNUSED(header), struct overlay_buffer *payload)
 {
   IN();
   
-  if (!mdp->out.payload_length) RETURN(-1);
+  int type=ob_get(payload);
 
-  int type=mdp->out.payload[0];
+  if (config.debug.rhizome_mdp_rx)
+    DEBUGF("Received Rhizome over MDP block, type=%02x",type);
+
   switch (type) {
   case 'B': /* data block */
   case 'T': /* terminal data block */
     {
-      if (mdp->out.payload_length<(1+16+8+8+1)) RETURN(-1);
-      unsigned char *bidprefix=&mdp->out.payload[1];
-      uint64_t version=read_uint64(&mdp->out.payload[1+16]);
-      uint64_t offset=read_uint64(&mdp->out.payload[1+16+8]);
-      int count=mdp->out.payload_length-(1+16+8+8);
-      unsigned char *bytes=&mdp->out.payload[1+16+8+8];
-      if (config.debug.rhizome_rx) 
-	DEBUGF("Received %d bytes @ 0x%llx for %s* version 0x%llx",
-	       count,offset,alloca_tohex(bidprefix,16),version);
+      unsigned char *bidprefix=ob_get_bytes_ptr(payload, 16);
+      uint64_t version=ob_get_ui64_rv(payload);
+      uint64_t offset=ob_get_ui64_rv(payload);
+      if (ob_overrun(payload))
+	RETURN(WHYF("Payload too short"));
+      size_t count = ob_remaining(payload);
+      unsigned char *bytes=ob_current_ptr(payload);
+      
+      if (config.debug.rhizome_mdp_rx)
+	DEBUGF("bidprefix=%02x%02x%02x%02x*, offset=%"PRId64", count=%zu",
+	       bidprefix[0],bidprefix[1],bidprefix[2],bidprefix[3],offset,count);
 
       /* Now see if there is a slot that matches.  If so, then
 	 see if the bytes are in the window, and write them.
@@ -177,9 +160,9 @@ int overlay_mdp_service_rhizomeresponse(overlay_mdp_frame *mdp)
 	 a slot to capture this files as it is being requested
 	 by someone else.
       */
-      rhizome_received_content(bidprefix,version,offset,count,bytes,type);
+      rhizome_received_content(bidprefix,version,offset, count, bytes);
 
-      RETURN(-1);
+      RETURN(0);
     }
     break;
   }
@@ -188,17 +171,20 @@ int overlay_mdp_service_rhizomeresponse(overlay_mdp_frame *mdp)
   OUT();
 }
 
-int overlay_mdp_service_dnalookup(overlay_mdp_frame *mdp)
+int overlay_mdp_service_dnalookup(struct internal_mdp_header *header, struct overlay_buffer *payload)
 {
   IN();
-  int cn=0,in=0,kp=0;
+  unsigned cn=0, in=0, kp=0;
   char did[64+1];
-  int pll=mdp->out.payload_length;
+  
+  int pll=ob_remaining(payload);
   if (pll>64) pll=64;
+  
   /* get did from the packet */
-  if (mdp->out.payload_length<1) {
-    RETURN(WHY("Empty DID in DNA resolution request")); }
-  bcopy(&mdp->out.payload[0],&did[0],pll);
+  if (pll<1)
+    RETURN(WHY("Empty DID in DNA resolution request"));
+  
+  ob_get_bytes(payload, (unsigned char *)did, pll);
   did[pll]=0;
   
   if (config.debug.mdprequests)
@@ -207,22 +193,24 @@ int overlay_mdp_service_dnalookup(overlay_mdp_frame *mdp)
   int results=0;
   while(keyring_find_did(keyring,&cn,&in,&kp,did))
     {
+      struct keypair *keypair = keyring->contexts[cn]->identities[in]->keypairs[kp];
       /* package DID and Name into reply (we include the DID because
 	 it could be a wild-card DID search, but the SID is implied 
 	 in the source address of our reply). */
-      if (keyring->contexts[cn]->identities[in]->keypairs[kp]->private_key_len > DID_MAXSIZE) 
+      if (keypair->private_key_len > DID_MAXSIZE) 
 	/* skip excessively long DID records */
 	continue;
-      const unsigned char *packedSid = keyring->contexts[cn]->identities[in]->keypairs[0]->public_key;
-      const char *unpackedDid = (const char *) keyring->contexts[cn]->identities[in]->keypairs[kp]->private_key;
-      const char *name = (const char *)keyring->contexts[cn]->identities[in]->keypairs[kp]->public_key;
+      
+      struct subscriber *subscriber = keyring->contexts[cn]->identities[in]->subscriber;
+      const char *unpackedDid = (const char *) keypair->private_key;
+      const char *name = (const char *)keypair->public_key;
       // URI is sid://SIDHEX/DID
       strbuf b = strbuf_alloca(SID_STRLEN + DID_MAXSIZE + 10);
       strbuf_puts(b, "sid://");
-      strbuf_tohex(b, packedSid, SID_SIZE);
+      strbuf_tohex(b, SID_STRLEN, subscriber->sid.binary);
       strbuf_puts(b, "/local/");
       strbuf_puts(b, unpackedDid);
-      overlay_mdp_dnalookup_reply(&mdp->out.src, packedSid, strbuf_str(b), unpackedDid, name);
+      overlay_mdp_dnalookup_reply(header->source, header->source_port, subscriber, strbuf_str(b), unpackedDid, name);
       kp++;
       results++;
     }
@@ -237,190 +225,172 @@ int overlay_mdp_service_dnalookup(overlay_mdp_frame *mdp)
        when results become available, so this function will return
        immediately, so as not to cause blockages and delays in servald.
     */
-    dna_helper_enqueue(mdp, did, mdp->out.src.sid);
+    dna_helper_enqueue(header->source, header->source_port, did);
     monitor_tell_formatted(MONITOR_DNAHELPER, "LOOKUP:%s:%d:%s\n", 
-			   alloca_tohex_sid(mdp->out.src.sid), mdp->out.src.port, 
+			   alloca_tohex_sid_t(header->source->sid), header->source_port, 
 			   did);
   }
   RETURN(0);
 }
 
-int overlay_mdp_service_echo(overlay_mdp_frame *mdp)
+int overlay_mdp_service_echo(struct internal_mdp_header *header, struct overlay_buffer *payload)
 {
-  /* Echo is easy: we swap the sender and receiver addresses (and thus port
-     numbers) and send the frame back. */
   IN();
-
-  /* Swap addresses */
-  overlay_mdp_swap_src_dst(mdp);
-  mdp->out.ttl=0;
   
-  /* Prevent echo:echo connections and the resulting denial of service from triggering endless pongs. */
-  if (mdp->out.dst.port==MDP_PORT_ECHO) {
-    RETURN(WHY("echo loop averted"));
-  }
-  /* If the packet was sent to broadcast, then replace broadcast address
-     with our local address. For now just responds with first local address */
-  if (is_sid_broadcast(mdp->out.src.sid))
-    {
-      if (my_subscriber)		  
-	bcopy(my_subscriber->sid,
-	      mdp->out.src.sid,SID_SIZE);
-      else
-	/* No local addresses, so put all zeroes */
-	bzero(mdp->out.src.sid,SID_SIZE);
-    }
+  if (header->source_port == MDP_PORT_ECHO)
+    RETURN(WHY("Prevented infinite echo loop"));
+    
+  struct internal_mdp_header response_header;
+  bzero(&response_header, sizeof response_header);
   
-  /* Always send PONGs auth-crypted so that the receipient knows
-     that they are genuine, and so that we avoid the extra cost 
-     of signing (which is slower than auth-crypting) */
-  int preserved=mdp->packetTypeAndFlags;
-  mdp->packetTypeAndFlags&=~(MDP_NOCRYPT|MDP_NOSIGN);
+  mdp_init_response(header, &response_header);
+  // keep all defaults
   
-  /* queue frame for delivery */
-  overlay_mdp_dispatch(mdp,0 /* system generated */,
-		       NULL,0);
-  mdp->packetTypeAndFlags=preserved;
-  
-  /* and switch addresses back around in case the caller was planning on
-     using MDP structure again (this happens if there is a loop-back reply
-     and the frame needs sending on, as happens with broadcasts.  MDP ping
-     is a simple application where this occurs). */
-  overlay_mdp_swap_src_dst(mdp);
-  RETURN(0);
+  RETURN(overlay_send_frame(&response_header, payload));
+  OUT();
 }
 
-static int overlay_mdp_service_trace(overlay_mdp_frame *mdp){
+/*
+ * Trace packets are a little weird so that they can be modified by every node
+ * and so they can bypass the routing table.
+ * 
+ * The true source and destination addresses are encoded inside the payload
+ * each node that processes the packet appends their own address before forwarding it to the next hop
+ * if their SID is already in the packet, the next hop is chosen from the immediately preceeding SID in the list.
+ * otherwise the next SID is chosen based on the current routing table.
+ * 
+ * In this way the packet can follow the path defined by each node's routing table
+ * Until the packet reaches the destination, the destination is unreachable, or the packet loops around the network
+ * Once any of these end states occurs, the packet attempts to travel back to the source node, 
+ * while using the source addresses in the trace packet for guidance instead of trusting the routing table.
+ * 
+ * It is hoped that this information can be useful to better understand the current network state 
+ * in situations where a routing protocol is in development.
+ */
+
+static int overlay_mdp_service_trace(struct internal_mdp_header *header, struct overlay_buffer *payload){
   IN();
+  struct overlay_buffer *next_payload = ob_new();
+  if (!next_payload)
+    RETURN(-1);
+  ob_append_bytes(next_payload, ob_current_ptr(payload), ob_remaining(payload));
+  
   int ret=0;
-  
-  struct overlay_buffer *b = ob_static(mdp->out.payload, sizeof(mdp->out.payload));
-  ob_limitsize(b, mdp->out.payload_length);
-  
-  struct subscriber *src=NULL, *dst=NULL, *last=NULL, *next=NULL;
+  struct subscriber *src=NULL, *dst=NULL, *last=NULL;
   struct decode_context context;
   bzero(&context, sizeof context);
   
-  if (overlay_address_parse(&context, b, &src)){
-    ret=WHYF("Invalid trace packet");
+  if (header->source_port == MDP_PORT_TRACE){
+    ret=WHYF("Invalid source port");
     goto end;
   }
-  if (overlay_address_parse(&context, b, &dst)){
-    ret=WHYF("Invalid trace packet");
+  if (overlay_address_parse(&context, payload, &src)){
+    ret=WHYF("Invalid source SID");
+    goto end;
+  }
+  if (overlay_address_parse(&context, payload, &dst)){
+    ret=WHYF("Invalid destination SID");
     goto end;
   }
   if (context.invalid_addresses){
-    ret=WHYF("Invalid address in trace packet");
+    ret=WHYF("Unknown address in trace packet");
     goto end;
   }
 
-  INFOF("Trace from %s to %s", alloca_tohex_sid(src->sid), alloca_tohex_sid(dst->sid));
+  INFOF("Trace from %s to %s", alloca_tohex_sid_t(src->sid), alloca_tohex_sid_t(dst->sid));
+  struct internal_mdp_header next_header;
+  next_header = *header;
+  next_header.source = my_subscriber;
+  next_header.destination = NULL;
   
-  while(ob_remaining(b)>0){
+  while(ob_remaining(payload)>0){
     struct subscriber *trace=NULL;
-    if (overlay_address_parse(&context, b, &trace)){
-      ret=WHYF("Invalid trace packet");
+    if (overlay_address_parse(&context, payload, &trace)){
+      ret=WHYF("Invalid SID in packet payload");
       goto end;
     }
     if (context.invalid_addresses){
-      ret=WHYF("Invalid address in trace packet");
+      ret=WHYF("Unknown SID in packet payload");
       goto end;
     }
-    INFOF("Via %s", alloca_tohex_sid(trace->sid));
+    INFOF("Via %s", alloca_tohex_sid_t(trace->sid));
     
-    if (trace->reachable==REACHABLE_SELF && !next)
+    if (trace->reachable==REACHABLE_SELF && !next_header.destination)
       // We're already in this trace, send the next packet to the node before us in the list
-      next = last;
+      next_header.destination = last;
     last = trace;
   }
   
   if (src->reachable==REACHABLE_SELF && last){
     // it came back to us, we can send the reply to our mdp client...
-    next=src;
-    mdp->out.dst.port=mdp->out.src.port;
-    mdp->out.src.port=MDP_PORT_TRACE;
+    next_header.destination=src;
+    next_header.destination_port = header->source_port;
+    next_header.source_port = MDP_PORT_TRACE;
   }
   
-  if (!next){
+  if (!next_header.destination){
     // destination is our neighbour?
     if (dst->reachable & REACHABLE_DIRECT)
-      next = dst;
+      next_header.destination = dst;
     // destination is indirect?
     else if (dst->reachable & REACHABLE_INDIRECT)
-      next = dst->next_hop;
+      next_header.destination = dst->next_hop;
     // destination is not reachable or is ourselves? bounce back to the previous node or the sender.
     else if (last)
-      next = last;
+      next_header.destination = last;
     else
-      next = src;
+      next_header.destination = src;
   }
   
-  INFOF("Next node is %s", alloca_tohex_sid(next->sid));
+  INFOF("Next node is %s", alloca_tohex_sid_t(next_header.destination->sid));
   
-  ob_unlimitsize(b);
   // always write a full sid into the payload
   my_subscriber->send_full=1;
-  if (overlay_address_append(&context, b, my_subscriber)){
+  overlay_address_append(&context, next_payload, my_subscriber);
+  if (ob_overrun(next_payload)) {
     ret = WHYF("Unable to append my address to the trace");
     goto end;
   }
-  
-  mdp->out.payload_length = ob_position(b);
-  bcopy(my_subscriber->sid, mdp->out.src.sid, SID_SIZE);
-  bcopy(next->sid, mdp->out.dst.sid, SID_SIZE);
-  
-  ret = overlay_mdp_dispatch(mdp, 0, NULL, 0);
+  ob_flip(next_payload);
+  ret = overlay_send_frame(&next_header, next_payload);
 end:
-  ob_free(b);
+  ob_free(next_payload);
   RETURN(ret);
 }
 
-static int overlay_mdp_service_manifest_response(overlay_mdp_frame *mdp){
-  int offset=0;
-  char id_hex[RHIZOME_MANIFEST_ID_STRLEN];
-  
-  while (offset<mdp->out.payload_length){
-    unsigned char *bar=&mdp->out.payload[offset];
-    tohex(id_hex, &bar[RHIZOME_BAR_PREFIX_OFFSET], RHIZOME_BAR_PREFIX_BYTES);
-    strcat(id_hex, "%");
+static int overlay_mdp_service_manifest_requests(struct internal_mdp_header *header, struct overlay_buffer *payload)
+{
+  while (ob_remaining(payload)) {
+    const unsigned char *bar = ob_get_bytes_ptr(payload, RHIZOME_BAR_BYTES);
+    if (!bar)
+      break;
     rhizome_manifest *m = rhizome_new_manifest();
     if (!m)
       return WHY("Unable to allocate manifest");
-    if (!rhizome_retrieve_manifest(id_hex, m)){
-      rhizome_advertise_manifest(m);
+    if (!rhizome_retrieve_manifest_by_prefix(&bar[RHIZOME_BAR_PREFIX_OFFSET], RHIZOME_BAR_PREFIX_BYTES, m)){
+      rhizome_advertise_manifest(header->source, m);
+      // pre-emptively send the payload if it will fit in a single packet
+      if (m->filesize > 0 && m->filesize <= 1024)
+	rhizome_mdp_send_block(header->source, &m->cryptoSignPublic, m->version, 0, 0, m->filesize);
     }
     rhizome_manifest_free(m);
-    offset+=RHIZOME_BAR_BYTES;
   }
-  
   return 0;
 }
 
-int overlay_mdp_try_interal_services(struct overlay_frame *frame, overlay_mdp_frame *mdp)
+void overlay_mdp_bind_internal_services()
 {
-  IN();
-  switch(mdp->out.dst.port) {
-  case MDP_PORT_LINKSTATE:        RETURN(link_receive(mdp));
-  case MDP_PORT_VOMP:             RETURN(vomp_mdp_received(mdp));
-  case MDP_PORT_KEYMAPREQUEST:    RETURN(keyring_mapping_request(keyring,mdp));
-  case MDP_PORT_DNALOOKUP:        RETURN(overlay_mdp_service_dnalookup(mdp));
-  case MDP_PORT_ECHO:             RETURN(overlay_mdp_service_echo(mdp));
-  case MDP_PORT_TRACE:            RETURN(overlay_mdp_service_trace(mdp));
-  case MDP_PORT_PROBE:            RETURN(overlay_mdp_service_probe(mdp));
-  case MDP_PORT_STUNREQ:          RETURN(overlay_mdp_service_stun_req(mdp));
-  case MDP_PORT_STUN:             RETURN(overlay_mdp_service_stun(mdp));
-  case MDP_PORT_RHIZOME_REQUEST: 
-    if (is_rhizome_mdp_server_running()) {
-      RETURN(overlay_mdp_service_rhizomerequest(mdp));
-    }
-    break;
-  case MDP_PORT_RHIZOME_RESPONSE: RETURN(overlay_mdp_service_rhizomeresponse(mdp));    
-  case MDP_PORT_RHIZOME_MANIFEST_REQUEST: RETURN(overlay_mdp_service_manifest_response(mdp));
-  case MDP_PORT_RHIZOME_SYNC: RETURN(overlay_mdp_service_rhizome_sync(frame, mdp));
-  }
-   
-  /* Unbound socket.  We won't be sending ICMP style connection refused
-     messages, partly because they are a waste of bandwidth. */
-  RETURN(WHYF("Received packet for which no listening process exists (MDP ports: src=%d, dst=%d",
-	      mdp->out.src.port,mdp->out.dst.port));
+  mdp_bind_internal(NULL, MDP_PORT_LINKSTATE, link_receive);
+  mdp_bind_internal(NULL, MDP_PORT_ECHO, overlay_mdp_service_echo);
+  mdp_bind_internal(NULL, MDP_PORT_RHIZOME_REQUEST, overlay_mdp_service_rhizomerequest);
+  mdp_bind_internal(NULL, MDP_PORT_RHIZOME_MANIFEST_REQUEST, overlay_mdp_service_manifest_requests);
+  mdp_bind_internal(NULL, MDP_PORT_RHIZOME_SYNC, overlay_mdp_service_rhizome_sync);
+  mdp_bind_internal(NULL, MDP_PORT_RHIZOME_RESPONSE, overlay_mdp_service_rhizomeresponse);
+  mdp_bind_internal(NULL, MDP_PORT_PROBE, overlay_mdp_service_probe);
+  mdp_bind_internal(NULL, MDP_PORT_STUNREQ, overlay_mdp_service_stun_req);
+  mdp_bind_internal(NULL, MDP_PORT_STUN, overlay_mdp_service_stun);
+  mdp_bind_internal(NULL, MDP_PORT_DNALOOKUP, overlay_mdp_service_dnalookup);
+  mdp_bind_internal(NULL, MDP_PORT_VOMP, vomp_mdp_received);
+  mdp_bind_internal(NULL, MDP_PORT_TRACE, overlay_mdp_service_trace);
+  mdp_bind_internal(NULL, MDP_PORT_KEYMAPREQUEST, keyring_mapping_request);
 }

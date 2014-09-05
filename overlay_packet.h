@@ -1,5 +1,5 @@
 /* 
- Serval Daemon
+ Serval DNA MDP overlay frame
  Copyright (C) 2012 Serval Project Inc.
  
  This program is free software; you can redistribute it and/or
@@ -17,8 +17,8 @@
  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#ifndef _SERVALD_OVERLAY_PACKET_H
-#define _SERVALD_OVERLAY_PACKET_H
+#ifndef __SERVAL_DNA__OVERLAY_PACKET_H
+#define __SERVAL_DNA__OVERLAY_PACKET_H
 
 #include "overlay_address.h"
 #include "serval.h"
@@ -26,50 +26,92 @@
 #define FRAME_NOT_SENT -1
 #define FRAME_DONT_SEND -2
 
+#define MAX_PACKET_DESTINATIONS OVERLAY_MAX_INTERFACES
+
+struct packet_destination{
+  // if we've sent this packet once, what was the envelope sequence number?
+  int sent_sequence;
+  // track when we last sent this packet. if we don't get an ack, send it again.
+  time_ms_t transmit_time;
+  // the actual out going stream for this packet
+  struct network_destination *destination;
+};
+
 struct overlay_frame {
+  // packet queue pointers
   struct overlay_frame *prev;
   struct overlay_frame *next;
+  // when did we insert into the queue?
+  time_ms_t enqueued_at;
   
+  // deprecated, all future "types" should just be assigned port numbers
   unsigned int type;
+  // encrypted? signed?
   unsigned int modifiers;
   
   unsigned char ttl;
+  // Which QOS queue?
   unsigned char queue;
+  // Should we keep trying until acked?
   char resend;
+  
+  // callback and context just before packet sending
   void *send_context;
   int (*send_hook)(struct overlay_frame *, int seq, void *context);
   
-  /* What sequence number have we used to send this packet on this interface.
-     */
-  int interface_sent_sequence[OVERLAY_MAX_INTERFACES];
-  int32_t mdp_sequence;
-  time_ms_t interface_dont_send_until[OVERLAY_MAX_INTERFACES];
-  struct broadcast broadcast_id;
+  // when should we send it?
+  time_ms_t delay_until;
+  // where should we send it?
+  struct packet_destination destinations[MAX_PACKET_DESTINATIONS];
+  int destination_count;
+  // how often have we sent it?
+  int transmit_count;
   
-  // null if destination is broadcast
+  // each payload gets a sequence number that is reused on retransmission
+  int32_t mdp_sequence;
+  
+  // packet addressing;
+  // where did this packet originate?
+  struct subscriber *source;
+  // where is this packet destined for
+  // for broadcast packets, the destination will be null and the broadcast_id will be set if ttl>1
   struct subscriber *destination;
+  struct broadcast broadcast_id;
+  // where is this packet going next?
   struct subscriber *next_hop;
   
+  // should we force the next packet header to include our full public key?
   int source_full;
-  struct subscriber *source;
   
-  /* IPv4 address the frame was received from, or should be sent to */
-  int destination_resolved;
-  struct sockaddr_in recvaddr;
-  overlay_interface *interface;
+  // how did we receive this packet?
+  struct overlay_interface *interface;
+  
+  // packet envelope header;
+  // Was it a unicast frame
   char unicast;
+  // what encoding version was used / should be used?
   int packet_version;
-  time_ms_t dont_send_until;
+  // which interface did the previous hop sent it from? 
+  int sender_interface;
   
-  /* Actual payload */
+  // Raw wire format of the payload, probably encrypted or signed.
   struct overlay_buffer *payload;
-  
-  time_ms_t enqueued_at;
-  
+};
+
+// simple representation for passing mdp packet header details
+struct internal_mdp_header{
+  struct subscriber *source;
+  mdp_port_t source_port;
+  struct subscriber *destination;
+  mdp_port_t destination_port;
+  uint8_t ttl;
+  uint8_t qos;
+  uint8_t crypt_flags; // combination of MDP_FLAG_NO_CRYPT & MDP_FLAG_NO_SIGN flags
+  struct overlay_interface *receive_interface;
 };
 
 
 int op_free(struct overlay_frame *p);
 struct overlay_frame *op_dup(struct overlay_frame *f);
 
-#endif
+#endif //__SERVAL_DNA__OVERLAY_PACKET_H

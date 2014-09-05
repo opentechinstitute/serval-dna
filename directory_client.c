@@ -1,3 +1,21 @@
+/* 
+Serval DNA directory service client
+Copyright (C) 2013 Serval Project Inc.
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
 
 
 /*
@@ -15,7 +33,10 @@
 #include "serval.h"
 #include "str.h"
 #include "overlay_address.h"
+#include "overlay_packet.h"
+#include "overlay_buffer.h"
 #include "conf.h"
+#include "keyring.h"
 
 struct subscriber *directory_service;
 
@@ -32,59 +53,48 @@ struct sched_ent directory_alarm={
 #define DIRECTORY_UPDATE_INTERVAL 120000
 
 // send a registration packet
-static void directory_send(struct subscriber *directory_service, const unsigned char *sid, const char *did, const char *name){
-  overlay_mdp_frame request;
-  
-  memset(&request, 0, sizeof(overlay_mdp_frame));
-  
-  request.packetTypeAndFlags = MDP_TX;
-  
-  bcopy(sid, request.out.src.sid, SID_SIZE);
-  request.out.src.port=MDP_PORT_NOREPLY;
-  request.out.queue=OQ_ORDINARY;
-  
-  bcopy(directory_service->sid, request.out.dst.sid, SID_SIZE);
-  request.out.dst.port=MDP_PORT_DIRECTORY;
-  request.out.payload_length = snprintf((char *)request.out.payload, sizeof(request.out.payload), 
-					"%s|%s", did, name);
+static void directory_send(struct subscriber *directory_service, struct subscriber *source, const char *did, const char *name)
+{
   // Used by tests
-  INFOF("Sending directory registration for %s, %s, %s to %s", 
-	alloca_tohex(sid,7), did, name, alloca_tohex(directory_service->sid, 7));
-  overlay_mdp_dispatch(&request, 0, NULL, 0);
+  INFOF("Sending directory registration for %s*, %s, %s to %s*", 
+	alloca_tohex_sid_t_trunc(source->sid, 14), did, name, alloca_tohex_sid_t_trunc(directory_service->sid, 14));
+	
+  struct internal_mdp_header header;
+  bzero(&header, sizeof header);
+  
+  header.source = source;
+  header.source_port = MDP_PORT_NOREPLY;
+  header.destination = directory_service;
+  header.destination_port = MDP_PORT_DIRECTORY;
+  header.qos = OQ_ORDINARY;
+  char buff[256];
+  struct overlay_buffer *payload = ob_static((unsigned char*)buff, sizeof buff);
+  ob_limitsize(payload, snprintf(buff, sizeof buff, "%s|%s", did, name));
+  overlay_send_frame(&header, payload);
+  ob_free(payload);
 }
 
 // send a registration packet for each unlocked identity
 static void directory_send_keyring(struct subscriber *directory_service){
-  int cn=0, in=0, kp=0, k2;
-  
+  unsigned cn=0, in=0, kp=0;
   for (; !keyring_sanitise_position(keyring, &cn, &in, &kp); ++kp){
     keyring_identity *i = keyring->contexts[cn]->identities[in];
-    
-    if (i->keypairs[kp]->type == KEYTYPE_CRYPTOBOX){
-      const unsigned char *packedSid = i->keypairs[0]->public_key;
-      
-      for(k2=0; k2 < i->keypair_count; k2++){
-	if (i->keypairs[k2]->type==KEYTYPE_DID){
-	  const char *unpackedDid = (const char *) i->keypairs[k2]->private_key;
-	  const char *name = (const char *) i->keypairs[k2]->public_key;
-	  
-	  directory_send(directory_service, packedSid, unpackedDid, name);
-	  // send the first DID only
-	  break;
-	}
-      }
+    if (i->subscriber && i->keypairs[kp]->type == KEYTYPE_DID){
+      const char *unpackedDid = (const char *) i->keypairs[kp]->private_key;
+      const char *name = (const char *) i->keypairs[kp]->public_key;
+      directory_send(directory_service, i->subscriber, unpackedDid, name);
     }
   }
 }
 
 static int load_directory_config()
 {
-  if (!directory_service && !is_sid_any(config.directory.service.binary)) {
+  if (!directory_service && !is_sid_t_any(config.directory.service)) {
     directory_service = find_subscriber(config.directory.service.binary, SID_SIZE, 1);
     if (!directory_service)
       return WHYF("Failed to create subscriber record");
     // used by tests
-    INFOF("ADD DIRECTORY SERVICE %s", alloca_tohex_sid(directory_service->sid));
+    INFOF("ADD DIRECTORY SERVICE %s", alloca_tohex_sid_t(directory_service->sid));
   }
   // always attempt to reload the address, may depend on DNS resolution
   return load_subscriber_address(directory_service);
@@ -94,7 +104,7 @@ static void directory_update(struct sched_ent *alarm){
   load_directory_config();
   
   if (directory_service){
-    if (subscriber_is_reachable(directory_service) & REACHABLE){
+    if (directory_service->reachable & REACHABLE){
       directory_send_keyring(directory_service);
       
       unschedule(alarm);

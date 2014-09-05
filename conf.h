@@ -222,8 +222,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  * @author Andrew Bettison <andrew@servalproject.com>
  */
 
-#ifndef __SERVALDNA_CONFIG_H
-#define __SERVALDNA_CONFIG_H
+#ifndef __SERVAL_DNA__CONF_H
+#define __SERVAL_DNA__CONF_H
 
 #include <stdint.h>
 #include <arpa/inet.h>
@@ -232,8 +232,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "strbuf.h"
 #include "serval.h"
 #include "rhizome.h"
-
-typedef char bool_t;
+#include "httpd.h"
 
 #define CONFIG_FILE_MAX_SIZE        (32 * 1024)
 #define INTERFACE_NAME_STRLEN       40
@@ -659,6 +658,9 @@ int cf_fmt_int32_nonneg(const char **, const int32_t *intp);
 int cf_opt_uint32_nonzero(uint32_t *intp, const char *text);
 int cf_fmt_uint32_nonzero(const char **, const uint32_t *intp);
 
+int cf_opt_uint32_scaled(uint32_t *intp, const char *text);
+int cf_fmt_uint32_scaled(const char **, const uint32_t *intp);
+
 int cf_opt_uint64_scaled(uint64_t *intp, const char *text);
 int cf_fmt_uint64_scaled(const char **, const uint64_t *intp);
 
@@ -703,4 +705,4 @@ int cf_reload();
 int cf_reload_strict();
 int cf_reload_permissive();
 
-#endif //__SERVALDNA_CONFIG_H
+#endif //__SERVAL_DNA__CONF_H

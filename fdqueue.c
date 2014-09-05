@@ -17,8 +17,36 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
-#include <poll.h>
-#include "serval.h"
+/*
+  Portions Copyright (C) 2013 Petter Reinholdtsen
+  Some rights reserved
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in
+     the documentation and/or other materials provided with the
+     distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#include "fdqueue.h"
 #include "conf.h"
 #include "str.h"
 #include "strbuf.h"
@@ -30,7 +58,7 @@ int fdcount=0;
 struct sched_ent *fd_callbacks[MAX_WATCHED_FDS];
 struct sched_ent *next_alarm=NULL;
 struct sched_ent *next_deadline=NULL;
-struct profile_total poll_stats={NULL,0,"Idle (in poll)",0,0,0};
+struct profile_total poll_stats={NULL,0,"Idle (in poll)",0,0,0,0};
 
 #define alloca_alarm_name(alarm) ((alarm)->stats ? alloca_str_toprint((alarm)->stats->name) : "Unnamed")
 
@@ -41,10 +69,10 @@ void list_alarms()
   struct sched_ent *alarm;
   
   for (alarm = next_deadline; alarm; alarm = alarm->_next)
-    DEBUGF("%p %s deadline in %lldms", alarm->function, alloca_alarm_name(alarm), alarm->deadline - now);
+    DEBUGF("%p %s deadline in %"PRId64"ms", alarm->function, alloca_alarm_name(alarm), alarm->deadline - now);
   
   for (alarm = next_alarm; alarm; alarm = alarm->_next)
-    DEBUGF("%p %s in %lldms, deadline in %lldms", alarm->function, alloca_alarm_name(alarm), alarm->alarm - now, alarm->deadline - now);
+    DEBUGF("%p %s in %"PRId64"ms, deadline in %"PRId64"ms", alarm->function, alloca_alarm_name(alarm), alarm->alarm - now, alarm->deadline - now);
   
   DEBUG("File handles;");
   int i;
@@ -86,13 +114,15 @@ int is_scheduled(const struct sched_ent *alarm)
 // on calling .poll.revents will be zero.
 int _schedule(struct __sourceloc __whence, struct sched_ent *alarm)
 {
+  time_ms_t now = gettime_ms();
   if (config.debug.io)
-    DEBUGF("schedule(alarm=%s) called from %s() %s:%d", 
-	   alloca_alarm_name(alarm),
-	   __whence.function,__whence.file,__whence.line);
+    DEBUGF("schedule(alarm=%s) alarm=%.3f deadline=%.3f",
+	  alloca_alarm_name(alarm),
+	  (double)(alarm->alarm - now) / 1000,
+	  (double)(alarm->deadline - now) / 1000
+	);
   if (!alarm->stats)
-    WARNF("schedule() called from %s() %s:%d without supplying an alarm name", 
-	  __whence.function,__whence.file,__whence.line);
+    WARN("schedule() called without supplying an alarm name");
 
   struct sched_ent *node = next_alarm, *last = NULL;
   
@@ -101,18 +131,20 @@ int _schedule(struct __sourceloc __whence, struct sched_ent *alarm)
   
   if (!alarm->function)
     return WHY("Can't schedule if you haven't set the function pointer");
-  
-  time_ms_t now = gettime_ms();
+
+  // don't bother to schedule an alarm that will (by definition) never run
+  if (alarm->alarm == TIME_NEVER_WILL)
+    return 0;
 
   if (alarm->deadline < alarm->alarm)
     alarm->deadline = alarm->alarm;
   
   if (now - alarm->deadline > 1000){
     // 1000ms ago? thats silly, if you keep doing it noone else will get a turn.
-    WHYF("Alarm %s tried to schedule a deadline %lldms ago, from %s() %s:%d",
+    FATALF("Alarm %s tried to schedule a deadline %"PRId64"ms ago",
 	   alloca_alarm_name(alarm),
-           (now - alarm->deadline),
-	   __whence.function,__whence.file,__whence.line);
+           (now - alarm->deadline)
+	);
   }
 
   // if the alarm has already expired, move straight to the deadline queue
@@ -169,19 +201,20 @@ int _watch(struct __sourceloc __whence, struct sched_ent *alarm)
   if (config.debug.io)
     DEBUGF("watch(alarm=%s)", alloca_alarm_name(alarm));
   if (!alarm->stats)
-    WARNF("watch() called from %s() %s:%d without supplying an alarm name", 
-	  __whence.function,__whence.file,__whence.line);
+    WARN("watch() called without supplying an alarm name");
 
   if (!alarm->function)
-    return WHY("Can't watch if you haven't set the function pointer");
+    FATAL("Can't watch if you haven't set the function pointer");
+  if (!alarm->poll.events)
+    FATAL("Can't watch if you haven't set any poll flags");
   
   if (alarm->_poll_index>=0 && fd_callbacks[alarm->_poll_index]==alarm){
     // updating event flags
     if (config.debug.io)
-      DEBUGF("Updating watch %s, #%d for %d", alloca_alarm_name(alarm), alarm->poll.fd, alarm->poll.events);
+      DEBUGF("Updating watch %s, #%d for %s", alloca_alarm_name(alarm), alarm->poll.fd, alloca_poll_events(alarm->poll.events));
   }else{
     if (config.debug.io)
-      DEBUGF("Adding watch %s, #%d for %d", alloca_alarm_name(alarm), alarm->poll.fd, alarm->poll.events);
+      DEBUGF("Adding watch %s, #%d for %s", alloca_alarm_name(alarm), alarm->poll.fd, alloca_poll_events(alarm->poll.events));
     if (fdcount>=MAX_WATCHED_FDS)
       return WHY("Too many file handles to watch");
     fd_callbacks[fdcount]=alarm;
@@ -191,6 +224,13 @@ int _watch(struct __sourceloc __whence, struct sched_ent *alarm)
   }
   fds[alarm->_poll_index]=alarm->poll;
   return 0;
+}
+
+int is_watching(struct sched_ent *alarm)
+{
+  if (alarm->_poll_index <0 || fds[alarm->_poll_index].fd!=alarm->poll.fd)
+    return 0;
+  return 1;
 }
 
 // stop watching a file handle
@@ -214,7 +254,7 @@ int _unwatch(struct __sourceloc __whence, struct sched_ent *alarm)
   fd_callbacks[fdcount]=NULL;
   alarm->_poll_index=-1;
   if (config.debug.io)
-    DEBUGF("%s stopped watching #%d for %d", alloca_alarm_name(alarm), alarm->poll.fd, alarm->poll.events);
+    DEBUGF("%s stopped watching #%d for %s", alloca_alarm_name(alarm), alarm->poll.fd, alloca_poll_events(alarm->poll.events));
   return 0;
 }
 
@@ -226,8 +266,8 @@ static void call_alarm(struct sched_ent *alarm, int revents)
   struct call_stats call_stats;
   call_stats.totals = alarm->stats;
   
-  if (config.debug.io) DEBUGF("Calling alarm/callback %p ('%s')",
-			      alarm, alloca_alarm_name(alarm));
+  if (config.debug.io)
+    DEBUGF("Calling alarm/callback %p %s", alarm, alloca_alarm_name(alarm));
 
   if (call_stats.totals)
     fd_func_enter(__HERE__, &call_stats);
@@ -238,7 +278,8 @@ static void call_alarm(struct sched_ent *alarm, int revents)
   if (call_stats.totals)
     fd_func_exit(__HERE__, &call_stats);
 
-  if (config.debug.io) DEBUGF("Alarm %p returned",alarm);
+  if (config.debug.io)
+    DEBUGF("Alarm %p returned",alarm);
 
   OUT();
 }
@@ -276,12 +317,8 @@ int fd_poll()
     call_stats.totals=&poll_stats;
     fd_func_enter(__HERE__, &call_stats);
     if (fdcount==0){
-      if (ms>=1000)
-	sleep(ms/1000);
-      else
-	usleep(ms*1000);
+      sleep_ms(ms);
     }else{
-      if (config.debug.io) DEBUGF("poll(X,%d,%d)",fdcount,ms);
       r = poll(fds, fdcount, ms);
       if (config.debug.io) {
 	strbuf b = strbuf_alloca(1024);
@@ -291,10 +328,10 @@ int fd_poll()
 	    strbuf_puts(b, ", ");
 	  strbuf_sprintf(b, "%d:", fds[i].fd);
 	  strbuf_append_poll_events(b, fds[i].events);
-	  strbuf_putc(b, ':');
+	  strbuf_puts(b, "->");
 	  strbuf_append_poll_events(b, fds[i].revents);
 	}
-	DEBUGF("poll(fds=(%s), fdcount=%d, ms=%d) = %d", strbuf_str(b), fdcount, ms, r);
+	DEBUGF("poll(fds=(%s), fdcount=%d, ms=%d) -> %d", strbuf_str(b), fdcount, ms, r);
       }
     }
     fd_func_exit(__HERE__, &call_stats);

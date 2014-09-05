@@ -17,7 +17,7 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
-#define __SERVALDNA_OS_INLINE
+#define __SERVAL_DNA__OS_INLINE
 #include "os.h"
 #include "str.h"
 #include "log.h"
@@ -88,7 +88,7 @@ int mkdirsn(const char *path, size_t len, mode_t mode)
   return -1;
 }
 
-int urandombytes(unsigned char *buf, unsigned long long len)
+int urandombytes(unsigned char *buf, size_t len)
 {
   static int urandomfd = -1;
   int tries = 0;
@@ -96,7 +96,7 @@ int urandombytes(unsigned char *buf, unsigned long long len)
     for (tries = 0; tries < 4; ++tries) {
       urandomfd = open("/dev/urandom",O_RDONLY);
       if (urandomfd != -1) break;
-      sleep(1);
+      sleep_ms(1000);
     }
     if (urandomfd == -1) {
       WHY_perror("open(/dev/urandom)");
@@ -105,8 +105,7 @@ int urandombytes(unsigned char *buf, unsigned long long len)
   }
   tries = 0;
   while (len > 0) {
-    int i = (len < 1048576) ? len : 1048576;
-    i = read(urandomfd, buf, i);
+    ssize_t i = read(urandomfd, buf, (len < 1048576) ? len : 1048576);
     if (i == -1) {
       if (++tries > 4) {
 	WHY_perror("read(/dev/urandom)");
@@ -129,7 +128,7 @@ time_ms_t gettime_ms()
   if (gettimeofday(&nowtv, NULL) == -1)
     FATAL_perror("gettimeofday");
   if (nowtv.tv_sec < 0 || nowtv.tv_usec < 0 || nowtv.tv_usec >= 1000000)
-    FATALF("gettimeofday returned tv_sec=%ld tv_usec=%ld", nowtv.tv_sec, nowtv.tv_usec);
+    FATALF("gettimeofday returned tv_sec=%ld tv_usec=%ld", (long)nowtv.tv_sec, (long)nowtv.tv_usec);
   return nowtv.tv_sec * 1000LL + nowtv.tv_usec / 1000;
 }
 
@@ -157,9 +156,30 @@ ssize_t read_symlink(const char *path, char *buf, size_t len)
   }
   ssize_t nr = readlink(path, buf, len);
   if (nr == -1)
-    return WHYF_perror("readlink(%s)", path);
-  if (nr >= len)
-    return WHYF("buffer overrun from readlink(%s, len=%lu)", path, (unsigned long) len);
+    return WHYF_perror("readlink(%s,%p,%zu)", path, buf, len);
+  if ((size_t)nr >= len)
+    return WHYF("buffer overrun from readlink(%s, len=%zu)", path, len);
   buf[nr] = '\0';
   return nr;
+}
+
+ssize_t read_whole_file(const char *path, unsigned char *buffer, size_t buffer_size)
+{
+  int fd = open(path, O_RDONLY);
+  if (fd == -1)
+    return WHYF_perror("open(%d,%s,O_RDONLY)", fd, alloca_str_toprint(path));
+  ssize_t ret;
+  struct stat stat;
+  if (fstat(fd, &stat) == -1)
+    ret = WHYF_perror("fstat(%d)", fd);
+  else if ((size_t)stat.st_size > buffer_size)
+    ret = WHYF("file %s (size %zu) is larger than available buffer (%zu)", alloca_str_toprint(path), (size_t)stat.st_size, buffer_size);
+  else {
+    ret = read(fd, buffer, buffer_size);
+    if (ret == -1)
+      ret = WHYF_perror("read(%d,%s,%zu)", fd, alloca_str_toprint(path), buffer_size);
+  }
+  if (close(fd) == -1)
+    ret = WHYF_perror("close(%d)", fd);
+  return ret;
 }

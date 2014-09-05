@@ -16,42 +16,22 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
-#ifndef __SERVALD_CONSTANTS_H
-#define __SERVALD_CONSTANTS_H
+#ifndef __SERVAL_DNA__CONSTANTS_H
+#define __SERVAL_DNA__CONSTANTS_H
 
-#define NELS(a) (sizeof (a) / sizeof *(a))
+/* Useful macros not specific to Serval DNA
+ */
 
-/* Packet format:
+// Number of elements in an array (Warning: does not work if A is a pointer!).
+#define NELS(A) (sizeof (A) / sizeof *(A))
 
-   16 bit - Magic value 0x4110
-   16 bit - Version number (0001 initially)
-   16 bit - Payload length
-   16 bit - Cipher method (0000 = clear text)
-   
-   Ciphered payload follows:
-   (needs to have no predictable data to protect against known plain-text attacks)
-   
-   64bit transaction id (random)
-   8bit - payload rotation (random, to help protect encryption from cribs)
+// To suppress the "unused parameter" warning from -Wunused-parameter.
+#ifdef __GNUC__
+#  define UNUSED(x) x __attribute__((__unused__))
+#else
+#  define UNUSED(x) x
+#endif
 
-   Remainder of payload, after correcting for rotation:
-   
-   33byte did|subscriber id
-   16byte salt
-   16byte hash of PIN+salt
-   
-   Remainder of packet is interpretted as a series of operations
-
-   8 bit operation: 
-   00 = get, 01 = set, 02 = delete, 03 = update,
-   80 = decline, 81 = okay (+optional result),
-   f0 = xfer HLR record
-   fe = random padding follows (to help protect cryptography from cribs)
-   ff = end of transaction
-   
-   get - 8 bit variable value
-
-*/
 #define SID_SIZE 32 // == crypto_sign_edwards25519sha512batch_PUBLICKEYBYTES
 #define SAS_SIZE 32 // == crypto_sign_edwards25519sha512batch_PUBLICKEYBYTES
 #define DID_MINSIZE 5
@@ -86,9 +66,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 		        Upto MTU bytes of payload.
 			32 bit channel/port indicator for each end. 
 		        */
-#define OF_TYPE_DATA_VOICE 0x40 /* Voice data frame. 
-			      Limited to 255 bytes of payload. 
-			      1 byte channel/port indicator for each end */
 #define OF_TYPE_RHIZOME_ADVERT 0x50 /* Advertisment of file availability via Rhizome */
 #define OF_TYPE_PLEASEEXPLAIN 0x60 /* Request for resolution of an abbreviated address */
 
@@ -97,6 +74,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define PAYLOAD_FLAG_ONE_HOP (1<<2)
 #define PAYLOAD_FLAG_CIPHERED (1<<4)
 #define PAYLOAD_FLAG_SIGNED (1<<5)
+#define PAYLOAD_FLAG_ACK_SOON (1<<6)
 
 /* Time-to-live is a 'uint5_t'.
  */
@@ -208,13 +186,25 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 // force state packet interval
 #define VOMP_CALL_STATUS_INTERVAL 1000
 
-#define DEFAULT_MONITOR_SOCKET_NAME "org.servalproject.servald.monitor.socket"
-#define DEFAULT_MDP_SOCKET_NAME "org.servalproject.servald.mdp.socket"
-
 #define SOCK_FILE 0xFF
 #define SOCK_UNSPECIFIED 0
 
 #define ENCAP_OVERLAY 1
 #define ENCAP_SINGLE 2
 
-#endif // __SERVALD_CONSTANTS_H
+// numbers chosen to not conflict with KEYTYPE flags
+#define UNLOCK_REQUEST (0xF0)
+#define UNLOCK_CHALLENGE (0xF1)
+#define UNLOCK_RESPONSE (0xF2)
+
+// should there be a types.h to hold this?
+typedef char bool_t;
+
+#define RULE_ALLOW 0
+#define RULE_DROP (1<<0)
+#define RULE_SOURCE (1<<1)
+#define RULE_DESTINATION (1<<2)
+#define RULE_SRC_PORT (1<<3)
+#define RULE_DST_PORT (1<<4)
+
+#endif // __SERVAL_DNA__CONSTANTS_H

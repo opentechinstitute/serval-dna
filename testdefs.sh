@@ -35,7 +35,7 @@ rexp_did='[0-9+#]\{5,\}'
 # Utility function for extracting information from the output of servald
 # commands that return "key:value\n" pairs.
 #
-#     extract_stdout_keyvalue optional <varname> <key> [<delimiter>] <regular-expression>
+#     extract_stdout_keyvalue_optional <varname> <key> [<delimiter>] <regular-expression>
 #
 # Examines the standard output of the last command executed using "execute" or
 # any of its variants.  If there is a line matching
@@ -55,14 +55,19 @@ extract_stdout_keyvalue_optional() {
    4) _delim="$3"; _rexp="$4";;
    *) error "invalid number of args";;
    esac
-   local _line=$(replayStdout | $GREP "^$_label$_delim")
+   local _label_re=$(escape_grep_basic "$_label")
+   local _delim_re=$(escape_grep_basic "$_delim")
+   local _line=$($GREP "^$_label_re$_delim_re" "$TFWSTDOUT")
    local _value=
    local _return=1
    if [ -n "$_line" ]; then
       _value="${_line#*$_delim}"
       _return=0
    fi
-   [ -n "$_var" ] && eval $_var="\$_value"
+   if [ -n "$_var" ]; then
+      eval $_var="\$_value"
+      eval tfw_log "$_var=\$(shellarg "\${$_var}")"
+   fi
    return $_return
 }
 
@@ -71,6 +76,57 @@ extract_stdout_keyvalue_optional() {
 extract_stdout_keyvalue() {
    local _label="$2"
    assert --message="stdout of ($executed) contains valid '$_label:' line" --stdout extract_stdout_keyvalue_optional "$@"
+}
+
+# Parse the standard result set output produced by the immediately preceding command
+# command into the following shell variables:
+#  NCOLS the number of columns
+#  NROWS the number of data rows (not counting headers)
+#  HEADER[c] the C-th header label, 0 <= C <= NCOLS-1
+#  <label>[R] where <label> is a header label with all non-alphanumerics
+#  replaced by underscore '_' and all alphas converted to upper case, eg,
+#  .author -> _AUTHOR, is the value of that column in the R-th row, 0 <=
+#  R < NROWS
+#
+# Warning: overwrites existing shell variables.  Names of overwritten shell
+# variables are derived directly from the output of the command, so cannot be
+# controlled.  If a prefix is supplied, all variables are prefixed with that.
+unpack_stdout_list() {
+   local prefix="$1"
+   {
+      local n
+      read n
+      eval ${prefix}NCOLS=\"\$n\"
+      declare -a ${prefix}HEADER
+      local -a header
+      local oIFS="$IFS"
+      IFS=:
+      read -r -a header
+      IFS="$oIFS"
+      eval ${prefix}HEADER="(\"\${header[@]}\")"
+      local hdr
+      local -a colvars=()
+      for hdr in "${header[@]}"; do
+         hdr="${hdr//[^A-Za-z0-9_]/_}"
+         # hdr="${hdr^^*}" would do in Bash-4.0 and later
+         hdr="$(echo "$hdr" | sed -e 's/.*/\U&/')"
+         colvars+=("$hdr")
+      done
+      local -a row
+      IFS=:
+      local i=0
+      while eval read -r -a row; do
+         local j=0
+         local val
+         for val in "${row[@]}"; do
+            eval ${prefix}${colvars[$j]}[$i]=\"\$val\"
+            let ++j
+         done
+         let ++i
+      done
+      IFS="$oIFS"
+      eval ${prefix}NROWS=$i
+   } < <(replayStdout)
 }
 
 # Utility function for creating servald fixtures:
@@ -90,6 +146,8 @@ setup_servald() {
    unset SERVALD_SERVER_CHDIR
    unset SERVALD_START_POST_SLEEP
    unset SERVALD_LOG_FILE
+   unset SERVALD_KEYRING_PATH
+   unset SERVALD_KEYRING_READONLY
    servald_instances_dir="$SERVALD_VAR/instance"
    set_instance +Z
 }
@@ -131,12 +189,30 @@ push_instance() {
 }
 
 # Utility function:
+#  - push the current instance on the instance stack and set the instance to the
+#    given arg
+#  - if set_instance fails, pops the instance stack before returning
+#    set_instance's exit status
+push_and_set_instance() {
+   push_instance
+   set_instance "$@" && return 0
+   status=$?
+   pop_instance
+   return $status
+}
+
+# Utility function:
 #  - pop an instance off the instance stack
 pop_instance() {
    local n=${#instance_stack[*]}
-   [ $n -eq 0 ] && error "instance stack underflow"
+   if [ $n -eq 0 ]; then
+      error "instance stack underflow"
+      return $?
+   fi
    let --n
+   set_instance +${instance_stack[$n]}
    unset instance_stack[$n]
+   return 0
 }
 
 # Utility function:
@@ -149,6 +225,7 @@ set_instance() {
    case "$1" in
    '')
       error "missing instance name argument"
+      return 1
       ;;
    +[A-Z])
       instance_arg="${1}"
@@ -170,9 +247,11 @@ set_instance() {
       export SERVALINSTANCE_PATH="$instance_dir/servald"
       instance_servald_log="$instance_dir/servald.log"
       instance_servald_pidfile="$SERVALINSTANCE_PATH/servald.pid"
+      return 0
       ;;
    *)
       error "malformed instance name argument, must be in form +[A-Z]"
+      return 1
       ;;
    esac
 }
@@ -205,7 +284,7 @@ foreach_instance() {
    local I
    for I in ${instances[*]}; do
       set_instance $I
-      if "$@"; then
+      if tfw_run "$@"; then
          case $mode in
          any) break;;
          esac
@@ -237,10 +316,10 @@ foreach_instance_with_pidfile() {
 }
 
 # Utility function for setting up servald JNI fixtures:
-#  - check that libservald.so is present
-#  - set LD_LIBRARY_PATH so that libservald.so can be found
+#  - check that libserval.so is present
+#  - set LD_LIBRARY_PATH so that libserval.so can be found
 setup_servald_so() {
-   assert [ -r "$servald_build_root/libservald.so" ]
+   assert [ -r "$servald_build_root/libserval.so" ]
    export LD_LIBRARY_PATH="$servald_build_root"
 }
 
@@ -252,6 +331,7 @@ setup_servald_so() {
 start_servald_server() {
    push_instance
    set_instance_fromarg "$1" && shift
+   configure_servald_server
    # Start servald server
    local -a before_pids
    local -a after_pids
@@ -293,7 +373,6 @@ start_servald_server() {
    assert --message="a new servald process is running" --dump-on-fail="$instance_servald_log" [ -n "$new_pids" ]
    assert --message="servald pidfile process is running" --dump-on-fail="$instance_servald_log" $pidfile_running
    assert --message="servald log file $instance_servald_log is present" [ -r "$instance_servald_log" ]
-   wait_until grep -q "Server started" "$instance_servald_log"
    tfw_log "# Started servald server process $instance_name, pid=$servald_pid"
    pop_instance
 }
@@ -540,7 +619,11 @@ assert_all_servald_servers_no_errors() {
 }
 
 # Utility function
-#  - create an identity in the current instance {I}
+#
+# create_single_identity [--option]... [ DID [ Name ]]
+#
+#  - create an identity in the current instance {I} by invoking the command:
+#    servald keyring add [--option]...
 #  - assign a phone number (DID) and name to the new identity, use defaults
 #    if not specified by arg1 and arg2
 #  - assert the new identity is the only one in this instance
@@ -548,12 +631,19 @@ assert_all_servald_servers_no_errors() {
 #  - set the DID{I} variable, eg DIDA, to the phone number of the new identity
 #  - set the NAME{I} variable, eg NAMEA, to the name of the new identity
 create_single_identity() {
+   local servald_options=()
+   while [ $# -gt 0 ]; do
+      case "$1" in
+      --*) servald_options+=("$1"); shift;;
+      *) break;;
+      esac
+   done
    local sidvar=SID${instance_name}1
    local didvar=DID${instance_name}1
    local namevar=NAME${instance_name}1
    eval "$didvar=\"\${1-\$((5550000 + \$instance_number))}\""
    eval "$namevar=\"\${2-Agent \$instance_name Smith}\""
-   create_identities 1
+   create_identities "${servald_options[@]}" 1
    eval "SID$instance_name=\"\${!sidvar}\""
    eval "DID$instance_name=\"\${!didvar}\""
    eval "NAME$instance_name=\"\${!namevar}\""
@@ -566,7 +656,12 @@ create_single_identity() {
 }
 
 # Utility function:
-#  - create N identities in the current instance {I}
+# 
+# create_identities [--option]... N
+#
+#  - create N identities in the current instance {I} using N consecutive
+#    invocations of: servald keyring add [--option]...
+#  - pass [args...] to the keyring add
 #  - if variables DID{I}{1..N} and/or NAME{I}{1..N} are already set, then use
 #    them to set the DIDs and names of each identity
 #  - assert that all SIDs are unique
@@ -575,14 +670,22 @@ create_single_identity() {
 #  - set variables DID{I}{1..N} to DIDs of identities, eg, DIDA1, DIDA2...
 #  - set variables NAME{I}{1..N} to names of identities, eg, NAMEA1, NAMEA2...
 create_identities() {
+   local servald_options=()
+   while [ $# -gt 0 ]; do
+      case "$1" in
+      --*) servald_options+=("$1"); shift;;
+      *) break;;
+      esac
+   done
    local N="$1"
    case "$N" in
    +([0-9]));;
    *) error "invalid arg1: $N";;
    esac
+   shift
    local i j
    for ((i = 1; i <= N; ++i)); do
-      executeOk_servald keyring add
+      executeOk_servald keyring add "${servald_options[@]}"
       assert [ -e "$SERVALINSTANCE_PATH/serval.keyring" ]
       local sidvar=SID$instance_name$i
       local didvar=DID$instance_name$i
@@ -593,7 +696,7 @@ create_identities() {
       # them, otherwise extract the DID and NAME automatically generated by
       # servald.
       if [ -n "${!didvar}" -o -n "${!namevar}" ]; then
-         executeOk_servald keyring set did "${!sidvar}" "${!didvar}" "${!namevar}"
+         executeOk_servald keyring set did "${servald_options[@]}" "${!sidvar}" "${!didvar}" "${!namevar}"
          eval "$didvar=\${!didvar}"
          eval "$namevar=\${!namevar}"
          tfw_log "$didvar=$(shellarg "${!didvar}")"
@@ -608,8 +711,7 @@ create_identities() {
          [ $i -ne $j ] && eval assert [ "\$SID$instance_name$i" != "\$SID$instance_name$j" ]
       done
    done
-   executeOk_servald keyring list
-   assertStdoutLineCount '==' $N
+   executeOk_servald keyring list "${servald_options[@]}"
    for ((i = 1; i <= N; ++i)); do
       local sidvar=SID$instance_name$i
       local didvar=DID$instance_name$i
@@ -623,7 +725,38 @@ create_identities() {
 #  - set up the configuration immediately prior to starting a servald server process
 #  - called by start_servald_instances
 configure_servald_server() {
-   :
+   add_servald_interface
+}
+
+add_servald_interface() {
+   local SOCKET_TYPE="dgram"
+   local INTERFACE="1"
+   local TYPE="wifi"
+   while [ $# -ne 0 ]; do
+      case "$1" in
+      --wifi) TYPE="wifi"; shift;;
+      --ethernet) TYPE="ethernet"; shift;;
+      --file) SOCKET_TYPE="file"; shift;;
+      *) INTERFACE="$1"; shift;;
+      esac
+   done
+   if [ "${SOCKET_TYPE}" == "file" ]; then
+      >>$SERVALD_VAR/dummy$INTERFACE
+      executeOk_servald config \
+         set server.interface_path $SERVALD_VAR \
+         set interfaces.$INTERFACE.socket_type $SOCKET_TYPE \
+         set interfaces.$INTERFACE.file dummy$INTERFACE \
+         set interfaces.$INTERFACE.type $TYPE \
+         set interfaces.$INTERFACE.dummy_address 127.0.$INTERFACE.$instance_number \
+         set interfaces.$INTERFACE.dummy_netmask 255.255.255.224
+   else
+      mkdir "$SERVALD_VAR/dummy$INTERFACE/"
+      executeOk_servald config \
+         set server.interface_path $SERVALD_VAR \
+         set interfaces.$INTERFACE.socket_type $SOCKET_TYPE \
+         set interfaces.$INTERFACE.file dummy$INTERFACE/$instance_name \
+         set interfaces.$INTERFACE.type $TYPE
+   fi
 }
 
 # Utility function:
@@ -635,31 +768,13 @@ configure_servald_server() {
 #  - wait for all instances to detect each other
 #  - assert that all instances are in each others' peer lists
 start_servald_instances() {
-   local DUMMY=dummy
-   case "$1" in
-   dummy*) DUMMY="$1"; shift;;
-   esac
    push_instance
-   tfw_log "# start servald instances DUMMY=$DUMMY $*"
-   local DUMMYNET="$SERVALD_VAR/$DUMMY"
-   >$DUMMYNET
-   local I
-   for I; do
-      set_instance $I
-      # These config settings can be overridden in a caller-supplied configure_servald_server().
-      # They are extremely useful for the majority of fixtures.
-      executeOk_servald config \
-         set interfaces.1.file "$DUMMYNET" \
-         set monitor.socket "org.servalproject.servald.monitor.socket.$TFWUNIQUE.$instance_name" \
-         set mdp.socket "org.servalproject.servald.mdp.socket.$TFWUNIQUE.$instance_name"
-      configure_servald_server
+   tfw_log "# start servald instances $*"
+   foreach_instance "$@" \
       start_servald_server
-      eval DUMMY$instance_name="\$DUMMYNET"
-   done
    # Now wait until they see each other.
    foreach_instance "$@" \
       wait_until --sleep=0.25 has_seen_instances "$@"
-   tfw_log "# dummynet file:" $(ls -l $DUMMYNET)
    pop_instance
 }
 
@@ -705,4 +820,53 @@ has_seen_instances() {
 #   selfannounce mechanism
 instances_see_each_other() {
    foreach_instance "$@" has_seen_instances "$@"
+}
+
+# Setup function:
+# - ensure that the given version of the curl(1) utility is available
+# - remove all proxy settings
+setup_curl() {
+   local minversion="${1?}"
+   local ver="$(curl --version | tr '\n' ' ')" 
+   case "$ver" in
+   '')
+      fail "curl(1) command is not present"
+      ;;
+   curl\ *\ Protocols:*\ http\ *)
+      set -- $ver
+      tfw_cmp_version "$2" 7
+      case $? in
+      0|2)
+         unset http_proxy
+         unset HTTP_PROXY
+         unset HTTPS_PROXY
+         unset ALL_PROXY
+         return 0
+         ;;
+      esac
+      fail "curl(1) version $2 is not adequate (expecting $minversion or higher)"
+      ;;
+   esac
+   fail "cannot parse output of curl --version: $ver"
+}
+
+# Setup function:
+# - ensure that version 1.2 or later of the jq(1) utility is available
+setup_jq() {
+   local minversion="${1?}"
+   local ver="$(jq --version 2>&1)"
+   case "$ver" in
+   '')
+      fail "jq(1) command is not present"
+      ;;
+   jq\ version\ *)
+      set -- $ver
+      tfw_cmp_version "$3" "$minversion"
+      case $? in
+      0|2) return 0;;
+      esac
+      fail "jq(1) version $3 is not adequate (need $minversion or higher)"
+      ;;
+   esac
+   fail "cannot parse output of jq --version: $ver"
 }

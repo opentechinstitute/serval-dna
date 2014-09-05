@@ -32,6 +32,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "strbuf.h"
 #include "strbuf_helpers.h"
 #include "conf.h"
+#include "dataformats.h"
 
 int cf_opt_boolean(bool_t *booleanp, const char *text)
 {
@@ -152,7 +153,7 @@ int cf_opt_rhizome_peer_from_uri(struct config_rhizome_peer *rpeer, const char *
   }
   const char *host;
   size_t hostlen;
-  unsigned short port = RHIZOME_HTTP_PORT;
+  uint16_t port = HTTPD_PORT;
   if (!str_uri_authority_hostname(auth, &host, &hostlen))
     return CFINVALID;
   str_uri_authority_port(auth, &port);
@@ -427,6 +428,30 @@ int cf_cmp_uint32_time_interval(const uint32_t *a, const uint32_t *b)
   return cf_cmp_uint32(a, b);
 }
 
+int cf_opt_uint32_scaled(uint32_t *intp, const char *text)
+{
+  uint32_t result;
+  const char *end;
+  if (!str_to_uint32_scaled(text, 10, &result, &end) || *end)
+    return CFINVALID;
+  *intp = result;
+  return CFOK;
+}
+
+int cf_fmt_uint32_scaled(const char **textp, const uint32_t *uintp)
+{
+  char buf[25];
+  int n = uint32_scaled_to_str(buf, sizeof buf, *uintp);
+  assert(n != 0);
+  *textp = str_edup(buf);
+  return CFOK;
+}
+
+int cf_cmp_uint32_scaled(const uint32_t *a, const uint32_t *b)
+{
+  return *a < *b ? -1 : *a > *b ? 1 : 0;
+}
+
 int cf_opt_uint64_scaled(uint64_t *intp, const char *text)
 {
   uint64_t result;
@@ -503,7 +528,7 @@ int cf_cmp_ushort_nonzero(const unsigned short *a, const unsigned short *b)
 int vld_argv(const struct cf_om_node *parent, struct config_argv *array, int result)
 {
   unsigned short last_key = 0;
-  int i;
+  unsigned i;
   if (array->ac) {
     unsigned short last_key = array->av[0].key;
     for (i = 1; i < array->ac; ++i) {
@@ -608,10 +633,14 @@ int cf_cmp_uint16_nonzero(const uint16_t *a, const uint16_t *b)
 
 int cf_opt_sid(sid_t *sidp, const char *text)
 {
+  if (strcasecmp(text, "broadcast")==0){
+    *sidp = SID_BROADCAST;
+    return CFOK;
+  }
   if (!str_is_subscriber_id(text))
     return CFINVALID;
-  size_t n = fromhex(sidp->binary, text, SID_SIZE);
-  assert(n == SID_SIZE);
+  int r = str_to_sid_t(sidp, text);
+  assert(r != -1);
   return CFOK;
 }
 
@@ -628,11 +657,7 @@ int cf_cmp_sid(const sid_t *a, const sid_t *b)
 
 int cf_opt_rhizome_bk(rhizome_bk_t *bkp, const char *text)
 {
-  if (!rhizome_str_is_bundle_key(text))
-    return CFINVALID;
-  size_t n = fromhex(bkp->binary, text, RHIZOME_BUNDLE_KEY_BYTES);
-  assert(n == RHIZOME_BUNDLE_KEY_BYTES);
-  return CFOK;
+  return str_to_rhizome_bk_t(bkp, text) ? CFOK : CFINVALID;
 }
 
 int cf_fmt_rhizome_bk(const char **textp, const rhizome_bk_t *bkp)
@@ -960,14 +985,6 @@ int vld_network_interface(const struct cf_om_node *parent, struct config_network
       return result | CFINCOMPLETE;
     }
   } else {
-    if (nifp->socket_type == SOCK_DGRAM && nifp->file[0]){
-      int nodei_socket_type = cf_om_get_child(parent, "socket_type", NULL);
-      int nodei_file = cf_om_get_child(parent, "file", NULL);
-      assert(nodei_socket_type != -1);
-      assert(nodei_file != -1);
-      cf_warn_incompatible(parent->nodv[nodei_socket_type], parent->nodv[nodei_file]);
-      return result | CFSUB(CFINCOMPATIBLE);
-    }
     if (nifp->socket_type != SOCK_DGRAM && !nifp->file[0]){
       cf_warn_missing_node(parent, "file");
       return result | CFSUB(CFINCOMPATIBLE);

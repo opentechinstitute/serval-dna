@@ -26,9 +26,6 @@
  *
  */
 
-#include "serval.h"
-#include "conf.h"
-
 #include <assert.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -46,12 +43,23 @@
 #ifndef SIOCGIFCONF
 #include <sys/sockio.h>
 #endif
-#include <netinet/in.h>
 #include <netinet/if_ether.h>
 #if __MACH__
 #include <net/if_dl.h>
 #endif
+#ifdef HAVE_LINUX_IF_H
+#include <linux/if.h>
+#else
+#if HAVE_NET_IF_H || __MACH__ || __NetBSD__ || __OpenBSD__ || __FreeBSD__
 #include <net/if.h>
+#endif
+#endif
+#ifdef HAVE_IFADDRS_H
+#include <ifaddrs.h>
+#endif
+
+#include "conf.h"
+#include "overlay_interface.h"
 
 /* On platforms that have variable length 
    ifreq use the old fixed length interface instead */
@@ -89,12 +97,22 @@ int scrapeProcNetRoute()
   line[0] = '\0';
   if (fgets(line,1024,f) == NULL)
     return WHYF_perror("fgets(%p,1024,\"/proc/net/route\")", line);
+    
+  struct socket_address addr, broadcast;
+  bzero(&addr, sizeof(addr));
+  bzero(&broadcast, sizeof(broadcast));
+  addr.addrlen = sizeof(addr.inet);
+  addr.inet.sin_family = AF_INET;
+  broadcast.addrlen = sizeof(addr.inet);
+  broadcast.inet.sin_family = AF_INET;
+  
   while(line[0]) {
     int r;
     if ((r=sscanf(line,"%s %s %*s %*s %*s %*s %*s %s",name,dest,mask))==3) {
-      struct in_addr addr = {.s_addr=strtol(dest,NULL,16)};
+      addr.inet.sin_addr.s_addr=strtol(dest,NULL,16);
       struct in_addr netmask = {.s_addr=strtol(mask,NULL,16)};
-      overlay_interface_register(name,addr,netmask);
+      broadcast.inet.sin_addr.s_addr=addr.inet.sin_addr.s_addr | ~netmask.s_addr;
+      overlay_interface_register(name,&addr,&broadcast);
     }
     line[0] = '\0';
     if (fgets(line,1024,f) == NULL)
@@ -116,10 +134,13 @@ int
 lsif(void) {
   char            buf[8192];
   struct ifconf   ifc;
-  int             sck, nInterfaces, ofs;
+  int             sck;
   struct ifreq    *ifr;
-  struct in_addr  addr, netmask;
-
+  struct in_addr  netmask;
+  struct socket_address addr, broadcast;
+  bzero(&addr, sizeof(addr));
+  bzero(&broadcast, sizeof(broadcast));
+  
   if (config.debug.overlayinterfaces) DEBUG("called");
 
   /* Get a socket handle. */
@@ -130,7 +151,7 @@ lsif(void) {
   }
  
   /* Query available interfaces. */
-  ifc.ifc_len = sizeof(buf);
+  ifc.ifc_len = sizeof buf;
   ifc.ifc_buf = buf;
   if(ioctl(sck, SIOCGIFCONF, &ifc) < 0) {
     WHY_perror("ioctl(SIOCGIFCONF)");
@@ -138,11 +159,13 @@ lsif(void) {
     return 1;
   }
 
-  /* Iterate through the list of interfaces. */
-  nInterfaces = 0;
-  ofs = 0;
+  broadcast.addrlen = sizeof(addr.inet);
+  broadcast.inet.sin_family = AF_INET;
   
-  while (ofs < ifc.ifc_len && ofs < sizeof(buf)) {
+  /* Iterate through the list of interfaces. */
+  unsigned nInterfaces = 0;
+  unsigned ofs = 0;
+  while (ofs < (unsigned)ifc.ifc_len && ofs < sizeof buf) {
     ifr = (struct ifreq *)(ifc.ifc_ifcu.ifcu_buf + ofs);
     ofs += _SIZEOF_ADDR_IFREQ(*ifr);
 
@@ -151,8 +174,9 @@ lsif(void) {
       if (config.debug.overlayinterfaces) DEBUGF("Skipping non-AF_INET address on %s", ifr->ifr_name);
       continue;
     }
-  
-    addr = ((struct sockaddr_in *)&ifr->ifr_ifru.ifru_addr)->sin_addr;
+    
+    addr.addrlen = sizeof(addr.inet);
+    bcopy(&ifr->ifr_ifru.ifru_addr, &addr.addr, addr.addrlen);
     
     /* Get interface flags */
     if (ioctl(sck, SIOCGIFFLAGS, ifr) == -1)
@@ -171,11 +195,13 @@ lsif(void) {
     }
     netmask = ((struct sockaddr_in *)&ifr->ifr_ifru.ifru_addr)->sin_addr;
     
-    overlay_interface_register(ifr->ifr_name, addr, netmask);
+    broadcast.inet.sin_addr.s_addr=addr.inet.sin_addr.s_addr | ~netmask.s_addr;
+    
+    overlay_interface_register(ifr->ifr_name, &addr, &broadcast);
     nInterfaces++;
   }
   
-  if (config.debug.overlayinterfaces) DEBUGF("Examined %d interface addresses", nInterfaces);
+  if (config.debug.overlayinterfaces) DEBUGF("Examined %u interface addresses", nInterfaces);
 
   close(sck); 
   return 0;
@@ -188,13 +214,19 @@ int
 doifaddrs(void) {
   struct ifaddrs	*ifaddr, *ifa;
   char 			*name;
-  struct in_addr	addr, netmask;
+  struct socket_address	addr, broadcast;
+  struct in_addr	netmask;
+  bzero(&addr, sizeof(addr));
+  bzero(&broadcast, sizeof(broadcast));
   
   if (config.debug.overlayinterfaces) DEBUGF("called");
   
   if (getifaddrs(&ifaddr) == -1)
     return WHY_perror("getifaddr()");
 
+  broadcast.addrlen = sizeof(addr.inet);
+  broadcast.inet.sin_family = AF_INET;
+  
   for (ifa = ifaddr; ifa != NULL ; ifa = ifa->ifa_next) {
     if (!ifa->ifa_addr || !ifa->ifa_netmask)
       continue;
@@ -212,10 +244,13 @@ doifaddrs(void) {
     }
 
     name = ifa->ifa_name;
-    addr = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+    addr.addrlen = sizeof(addr.inet);
+    bcopy(ifa->ifa_addr, &addr.addr, addr.addrlen);
+    
     netmask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr;
+    broadcast.inet.sin_addr.s_addr=addr.inet.sin_addr.s_addr | ~netmask.s_addr;
 
-    overlay_interface_register(name, addr, netmask);
+    overlay_interface_register(name, &addr, &broadcast);
   }
   freeifaddrs(ifaddr);
 
