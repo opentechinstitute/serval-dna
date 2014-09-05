@@ -1,0 +1,5 @@
+serval-dna (0.91-1) unstable; urgency=low
+
+  * Initial release (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+
+ -- Dan Staples <danstaples@opentechinstitute.org>  Wed, 21 Aug 2013 14:55:27 -0400

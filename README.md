@@ -1,3 +1,4 @@
+[![alt tag](http://img.shields.io/badge/maintainer-dismantl-green.svg)](https://github.com/dismantl)
 Serval DNA
 ==========
 [Serval Project][], December 2013

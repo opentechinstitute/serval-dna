@@ -1404,6 +1404,7 @@ int link_receive(struct internal_mdp_header *header, struct overlay_buffer *payl
       // TODO other link attributes...
     }
   }
+  ob_free(payload);
 
   send_please_explain(&context, my_subscriber, header->source);
 
