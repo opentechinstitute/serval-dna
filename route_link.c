@@ -914,7 +914,7 @@ static void update_alarm(struct __sourceloc __whence, time_ms_t limit)
 {
   if (limit == 0)
     FATALF("limit == 0");
-  if (link_send_alarm.alarm>limit){
+  if (link_send_alarm.alarm>limit && is_scheduled(&link_send_alarm)){
     unschedule(&link_send_alarm);
     link_send_alarm.alarm = limit;
     link_send_alarm.deadline = limit+10;
@@ -1404,7 +1404,7 @@ int link_receive(struct internal_mdp_header *header, struct overlay_buffer *payl
       // TODO other link attributes...
     }
   }
-  ob_free(payload);
+  
 
   send_please_explain(&context, my_subscriber, header->source);
 
