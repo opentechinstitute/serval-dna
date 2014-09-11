@@ -60,7 +60,8 @@ overlay_interface_close(overlay_interface *interface){
   if (interface->address.addr.sa_family == AF_UNIX)
     unlink(interface->address.local.sun_path);
   link_interface_down(interface);
-  unschedule(&interface->alarm);
+  if (is_scheduled(&interface->alarm))
+    unschedule(&interface->alarm);
   if (is_watching(&interface->alarm))
     unwatch(&interface->alarm);
   close(interface->alarm.poll.fd);

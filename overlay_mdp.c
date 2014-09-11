@@ -907,8 +907,8 @@ int overlay_send_frame(struct internal_mdp_header *header,
   
     /* crypted and signed (using CryptoBox authcryption primitive) */
     frame->payload = encrypt_payload(frame->source, frame->destination, ob_ptr(plaintext), ob_position(plaintext));
+    ob_free(plaintext);
     if (!frame->payload){
-      ob_free(plaintext);
       op_free(frame);
       return -1;
     }
@@ -925,6 +925,7 @@ int overlay_send_frame(struct internal_mdp_header *header,
         || crypto_sign_message(frame->source->identity, ob_ptr(frame->payload), frame->payload->allocSize, &frame->payload->position) == -1
     ) {
       op_free(frame);
+      ob_free(plaintext);
       return -1;
     }
 #if 0
@@ -949,6 +950,7 @@ int overlay_send_frame(struct internal_mdp_header *header,
   
   if (overlay_payload_enqueue(frame)){
     op_free(frame);
+    ob_free(plaintext);
     return -1;
   }
   
