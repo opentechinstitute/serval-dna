@@ -1,4 +1,7 @@
 [![alt tag](http://img.shields.io/badge/maintainer-dismantl-green.svg)](https://github.com/dismantl)
+
+This is the [Commotion](https://commotionwireless.net/) fork of Serval DNA. It includes minor fixes and modifications and custom Debian packaging.
+
 Serval DNA
 ==========
 [Serval Project][], December 2013
